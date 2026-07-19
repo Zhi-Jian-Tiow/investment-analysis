@@ -1,0 +1,1761 @@
+# BursaTrack — V1 User Stories
+
+> **Purpose:** Sprint-ready backlog for V1 implementation, derived from BursaTrack-PRD-Final.md, BursaTrack-BAS-Enhanced Parts 1–3, BursaTrack-Solution-Architecture.md, and the API/DB design artifacts.<br>
+> **Format:** Each story = a Given/When/Then developer action plan + technical detail block (Acceptance Criteria, Definition of Done, Dependencies & Integrations, Technical Constraints).<br>
+> **Traceability:** `FR-xxx` = PRD/BAS functional requirement, `BR-xxx` = business rule, `VR-xxx` = validation rule, `EX-xxx` = exception, `EC-xxx` = edge case, `ADR-xxx` = architecture decision. IDs let QA and engineering cross-reference the BAS/architecture docs directly.<br>
+> **Open items:** Several stories below are flagged `⚠ STAKEHOLDER SIGN-OFF PENDING` where the source BAS lists an unresolved OQ (open question). These do not block starting the story but must be resolved before the story is marked done.
+
+---
+
+## How Epics Map to the Architecture
+
+Epics follow the five domain modules defined in the Solution Architecture (§7.2, P-008), plus one cross-cutting Deployment/Infrastructure epic:
+
+| Epic                                  | Architecture Module     | FRs Covered                             |
+| ------------------------------------- | ----------------------- | --------------------------------------- |
+| 1. Authentication & Account Lifecycle | `auth`                  | FR-001, FR-002, FR-017                  |
+| 2. Portfolio — Positions & Lots       | `portfolio`             | FR-003, FR-004, FR-005, FR-006          |
+| 3. Dividend Tracking                  | `portfolio`             | FR-009, FR-010, FR-013                  |
+| 4. Dashboard & Sell Calculator        | `portfolio`             | FR-011, FR-012                          |
+| 5. Pricing & Market Data              | `pricing`               | FR-007, FR-008                          |
+| 6. CSV Import & Export                | `portfolio` / `pricing` | FR-014, FR-015                          |
+| 7. Subscription & Billing             | `subscription`          | FR-016                                  |
+| 8. PDPA Compliance & Admin            | `admin`                 | FR-018, FR-019, BrokerConfig/fee config |
+| 9. Deployment & Infrastructure        | cross-cutting           | —                                       |
+
+Each Epic's stories are split into **Backend**, **Frontend**, and **Deployment** stories per the module structure in Solution-Architecture §7.2.
+
+---
+
+# Epic 1 — Authentication & Account Lifecycle
+
+## BE-1.1 — User Registration & Email Verification API
+
+**FR-001 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given the auth module is scaffolded with fastapi-users and the users/portfolios tables exist
+When a client POSTs to /auth/register with email, password, password_confirm, and default_broker_id
+Then a User row is created with account_status="trial", trial_expiry_date = today + 14 days,
+     an empty Portfolio is created and linked, a pending_tokens row (type=email_verification,
+     24h expiry) is created, a verification email is queued via BackgroundTasks,
+     and the response sets the JWT session cookie so the user is logged in immediately
+```
+
+**Acceptance Criteria**
+
+- [ ] `POST /auth/register` validates email (VR-001: RFC 5321, ≤254 chars, unique, lowercase-normalized), password (VR-002: 8–128 chars, ≥1 uppercase, ≥1 digit), and `password_confirm` match
+- [ ] Duplicate email returns a 409-class error, not a 500; message: "An account with this email already exists"
+- [ ] `default_broker_id` must reference an active `BrokerConfig` (VR-007)
+- [ ] User created with `token_version=0`, `email_verified=false`
+- [ ] `GET /auth/verify?token=xxx` validates the token (exists, unused, not expired), marks `email_verified=true`; expired token returns "link expired" error; already-used token returns "already used" error
+- [ ] User is **not** blocked from any feature during trial while unverified (EX-007) — verification is a security banner, not a gate
+- [ ] Registration email failure (EX-007) does not fail the registration request; a "Resend verification email" capability exists server-side
+- [ ] `audit_log` entry `USER_REGISTERED` written in the same transaction as the User/Portfolio insert
+- [ ] Rate limited to 3/minute per IP (architecture §14.4)
+
+**Definition of Done**
+
+- [ ] Unit tests cover: happy path, duplicate email, password mismatch, invalid email format, expired/used verification token (BAS US-001 Gherkin scenarios pass)
+- [ ] Registration + Portfolio creation + audit log insert are atomic (single DB transaction)
+- [ ] No plaintext password ever logged (structlog payload sanitization verified)
+- [ ] Endpoint documented in OpenAPI spec matches `03-openapi-specification.md` `/auth/register`, `/auth/verify`
+
+**Dependencies & Integrations**
+
+- `BrokerConfig` seed data must exist first (Epic 9 — DB baseline) since registration requires a valid `default_broker_id`
+- Resend API key configured (email delivery)
+- `pending_tokens` table (architecture §14.1)
+
+**Technical Constraints**
+
+- Password hashed with bcrypt CF12, executed in a thread pool executor (MED-R-002) — must not block the async event loop
+- Email verification email sent via `BackgroundTasks`, not inline in the request/response cycle
+- `password_hash` and `token_version` must never appear in any response schema (PDPA / API security review PD requirement)
+
+---
+
+## BE-1.2 — Login, Logout, Session Refresh & Rate Limiting
+
+**FR-002 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a verified or unverified user account exists
+When the user POSTs correct credentials to /auth/login
+Then the system sets an HTTP-only, Secure, SameSite=Lax JWT cookie (RS256, 7-day exp,
+     payload includes user_id and token_version) and returns the portfolio dashboard route
+```
+
+**Acceptance Criteria**
+
+- [ ] `POST /auth/login`: on success, resets failed-attempt counter to 0; on failure, increments counter and returns a generic "Email or password is incorrect" message (no account enumeration)
+- [ ] BR-016: 5 failed attempts within 10 minutes from the same IP locks further attempts for 10 minutes with message "Too many failed attempts. Please wait 10 minutes before trying again."
+- [ ] `POST /auth/logout` increments `token_version`, invalidating all existing JWTs for that user immediately
+- [ ] `POST /auth/refresh` accepts a valid non-expired JWT and issues a new 7-day JWT if `token_version` still matches; returns 401 otherwise
+- [ ] `GET /auth/jwks.json` publishes the RS256 public key
+- [ ] Session cookie is never readable by JavaScript (`HttpOnly`); verified with a security test (BAS §14 Security Test Cases)
+- [ ] EX-010: an expired/revoked JWT on any authenticated request returns 401; frontend redirects to login with "Your session has expired"
+
+**Definition of Done**
+
+- [ ] Security test cases from BAS §14 pass: cookie is HTTP-only/Secure, lockout triggers at exactly 5 failures, reset token/session invalidation confirmed
+- [ ] Rate limiting via SlowAPI: 5/minute per IP on `/auth/login` (architecture §14.4)
+- [ ] `token_version` mismatch correctly rejected with `token_revoked` error code (per API error catalog, ADD-002)
+
+**Dependencies & Integrations**
+
+- `fastapi-users` JWT strategy configured with RS256 key pair (`JWT_PRIVATE_KEY` Render env var)
+- SlowAPI middleware installed and configured per-route
+
+**Technical Constraints**
+
+- JWT expiry is 7 days (not 30 — HIGH-R-001/HIGH-R-010), with silent refresh handled client-side when `exp` is within 24 hours
+- No server-side session store — all session state is in the stateless JWT + `token_version` column (P-002, no Redis)
+
+---
+
+## BE-1.3 — Password Reset Flow
+
+**FR-017 · Priority: Must Have** ⚠ _STAKEHOLDER SIGN-OFF PENDING (OQ-007: confirm Must Have classification, not a fast-follow)_
+
+**Developer Action Plan**
+
+```gherkin
+Given a user has forgotten their password
+When they POST their email to /auth/password-reset-request
+Then the system returns the identical response ("If an account with that email exists,
+     a reset link has been sent.") regardless of whether the account exists, and — only
+     if the account exists — generates a single-use pending_tokens row (type=password_reset,
+     1-hour expiry) and queues the reset email
+```
+
+**Acceptance Criteria**
+
+- [ ] Response body and response timing are indistinguishable between an existing and non-existing email (account enumeration protection — security test in BAS §14)
+- [ ] `POST /auth/password-reset` validates token (exists, unused, ≤1 hour old); expired → "This reset link has expired. Request a new one?"; already used → "This reset link has already been used. If you did not reset your password, contact support."
+- [ ] New password validated per VR-002; on success, `password_hash` updated, `token_version` incremented (invalidates **all** active sessions, per BR-019/EX-011), token marked `used_at=now()`
+- [ ] EX-011: email delivery failure does not change the user-facing response (still the generic message); failure logged server-side for support escalation
+- [ ] EC-017: resetting the password for a never-verified account also marks the email as verified (user demonstrated control of the inbox)
+- [ ] Rate limited to 3/minute per IP
+
+**Definition of Done**
+
+- [ ] Gherkin scenarios from BAS US-021 (happy path, expired token, enumeration prevention) automated as integration tests
+- [ ] Generating a new reset token for the same `(user_id, type)` deletes the previous pending token row (HIGH-R-011)
+
+**Dependencies & Integrations**
+
+- Shares the `pending_tokens` table with email verification (BE-1.1) and deletion cancellation (BE-8.2)
+- Resend for email delivery
+
+**Technical Constraints**
+
+- Token is an opaque, single-use value; only its SHA-256 hash is stored (`token_hash`), never the raw token
+- No behavioral branch in the code path may create a timing difference between "found" and "not found" cases
+
+---
+
+## FE-1.1 — Registration & Onboarding UI
+
+**FR-001 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a visitor is on the marketing site
+When they click "Create Account" and submit email, password, password confirmation, and default broker
+Then they are redirected to the dashboard with a persistent banner "Please verify your email.
+     Check your inbox." and can immediately begin adding positions
+```
+
+**Acceptance Criteria**
+
+- [ ] Inline field validation matches VR-001/VR-002 error copy exactly (e.g., "Passwords do not match", "Please enter a valid email address")
+- [ ] Broker dropdown is pre-populated from `GET /api/v1/brokers` (system brokers only at this stage)
+- [ ] Time-to-first-value: onboarding form → dashboard → first position addable in under 10 minutes end-to-end (PRD Principle 2 — this is a UX design constraint, not just a build task)
+- [ ] "Resend verification email" control visible on the banner; disabled with a cooldown after use
+- [ ] Duplicate-email error surfaces the PRD-specified copy: "An account with this email already exists. Log in instead?" with a link to `/login`
+
+**Definition of Done**
+
+- [ ] Component tested against all BAS US-001 Gherkin scenarios (happy path, duplicate email, password mismatch, invalid email)
+- [ ] Responsive from 375px viewport (NG-001 — no native app, must work on mobile web)
+- [ ] No client-side storage of password or token in localStorage/sessionStorage (architecture §8.1 — all state in React/SWR)
+
+**Dependencies & Integrations**
+
+- BE-1.1 registration/verification endpoints
+- `GET /api/v1/brokers` (Epic 8 — BrokerConfig)
+
+**Technical Constraints**
+
+- Built with shadcn/ui + Tailwind, TypeScript strict mode
+- Uses the shared `lib/api.ts` fetch wrapper with `credentials: include`
+
+---
+
+## FE-1.2 — Login UI & Session Management
+
+**FR-002 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a registered user is on the login page
+When they submit correct credentials
+Then they land on the portfolio dashboard, and on any subsequent page load the client checks
+     the JWT exp claim and silently calls /auth/refresh if expiry is within 24 hours
+```
+
+**Acceptance Criteria**
+
+- [ ] Failed login shows the generic error message; after the 5th failure within 10 minutes, the form is disabled with the lockout message and a visible countdown
+- [ ] Successful login redirects to `/dashboard`; unverified-but-active users see the persistent verification banner, not a login block (US-002 permission scenario)
+- [ ] On receiving a 401 from any API call, the client redirects to `/login` with "Your session has expired. Please log in again." and returns the user to their last-viewed page after re-authentication (EX-010)
+- [ ] Silent refresh is invisible to the user — no interruption to an active session within the 7-day window
+
+**Definition of Done**
+
+- [ ] E2E test: session expiry mid-use triggers redirect and post-login return-to-page behavior
+- [ ] No JWT or session data read/written via `document.cookie` in application code (cookie is HTTP-only by design; frontend never touches it directly)
+
+**Dependencies & Integrations**
+
+- BE-1.2 login/refresh endpoints
+- `SubscriptionGate` component (Epic 7) wraps protected routes and checks account status on the same request path
+
+**Technical Constraints**
+
+- All authenticated API calls go through the shared `lib/api.ts` wrapper so the refresh-check logic lives in one place, not duplicated per page
+
+---
+
+## FE-1.3 — Forgot Password / Reset Password UI
+
+**FR-017 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user has forgotten their password
+When they submit their email on the "Forgot Password" page
+Then they see "If an account with that email exists, a reset link has been sent." and,
+     upon clicking a valid emailed link, are shown a "Set New Password" form
+```
+
+**Acceptance Criteria**
+
+- [ ] Identical confirmation message shown regardless of account existence (no UI branch that could leak enumeration info)
+- [ ] Expired-token and already-used-token states render distinct, actionable messages (BAS Workflow 8 alternative flows)
+- [ ] On successful reset, user is redirected to `/login` with "Password updated successfully. Please log in." — no auto-login (BR-019 sessions are invalidated, this is intentional)
+
+**Definition of Done**
+
+- [ ] All three Workflow 8 alternative flows (expired, already used, happy path) covered by component tests
+
+**Dependencies & Integrations**
+
+- BE-1.3
+
+**Technical Constraints**
+
+- None beyond standard form validation using the shared password rules from VR-002
+
+---
+
+# Epic 2 — Portfolio: Positions & Lots
+
+## BE-2.1 — Add Position (First Lot) with Server-Side Fee Calculation
+
+**FR-003 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given an authenticated user with an active (trial or paid) account
+When they POST stock_code, shares, purchase_price, purchase_date, and broker_id to
+     /api/v1/portfolio/positions
+Then the server calculates initial_amount, brokerage_fee, clearing_fee, stamp_duty, and
+     all_in_cost using Decimal arithmetic, persists a Lot and a Position, and returns
+     the position with its computed fee breakdown
+```
+
+**Acceptance Criteria**
+
+- [ ] Fee engine implements BR-001–BR-007 exactly: `brokerage = MAX(initial_amount × rate, minimum_fee)` for percentage brokers, flat fee otherwise (BR-001/002); brokerage applied per lot, not per position (BR-003); `clearing_fee = initial_amount × 0.0003`, capped at RM1,000/contract (BR-005); `stamp_duty = ROUNDUP(initial_amount / 1000, 0)`, RM1 minimum (BR-006); `all_in_cost` = sum of all four components (BR-007)
+- [ ] Rounding follows BR-025 exactly: each fee component individually rounded half-away-from-zero to 2dp before summing — verified against the worked boundary examples (RM12.575 → RM12.58)
+- [ ] Reference test cases from BAS US-003 pass numerically: Maybank Investment 5,000 CIMB @ RM8.38 → all-in RM41,996.47; MooMoo flat fee → all-in RM41,957.57; brokerage-minimum case (FM 7210, 5,000 @ RM0.60) → all-in RM3,011.90
+- [ ] VR-003 (valid Bursa stock code), VR-004 (shares ≥1, integer, ≤99,999,999), VR-005 (price >0, ≤4dp), VR-006 (purchase_date not future) all enforced with the exact BAS error copy
+- [ ] EC-001: adding a stock code that already exists as an active position is treated as "Add Lot" (BE-2.2 flow), not a duplicate Position — with the notification copy from BAS
+- [ ] EC-002: zero-brokerage (custom broker rate=0) is valid, not an error
+- [ ] EC-004: purchase date on a non-trading day is accepted with a soft warning, not blocked
+- [ ] `audit_log` entry `LOT_CREATED` written in the same transaction
+
+**Definition of Done**
+
+- [ ] `portfolio/calculator.py` is the single authoritative fee-calculation module — every other code path (Add Lot, Edit, Sell Calculator, CSV import) calls into it, never duplicates the formula (architecture P-003, P-005, G-001)
+- [ ] Unit test suite covers every BR-001–BR-007 case plus the P1 test matrix from BAS §14 (brokerage min/percentage/flat, clearing fee cap, stamp duty boundary)
+- [ ] No `float`/`double` anywhere in the calculation path — `Decimal` only (R-003 mitigation); a lint/mypy check flags any `float` introduced in this module
+- [ ] Response schema matches `03-openapi-specification.md` `/api/v1/portfolio/positions` (all monetary fields `type: string`, per API security review FC-001–007)
+
+**Dependencies & Integrations**
+
+- `BrokerConfig` and `Stock` reference tables must be seeded (Epic 9)
+- `system_config` for stamp duty rate and clearing fee percentage (BR-015 configurability)
+
+**Technical Constraints**
+
+- All monetary columns are PostgreSQL `NUMERIC` (never `FLOAT`); `purchase_price` is `NUMERIC(12,4)`, fee/cost fields are `NUMERIC(14,2)` (architecture §12.3)
+- The server is the sole source of truth for stored fee values — any client-side fee preview is display-only and must never be trusted or persisted (P-003)
+
+---
+
+## BE-2.2 — Add Lot to Existing Position
+
+**FR-004 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a Position already exists for a stock in the user's portfolio
+When the user POSTs a new lot to /api/v1/portfolio/positions/{id}/lots
+Then the server calculates the new lot's fees independently (BR-003: brokerage per
+     transaction), creates the Lot, and recalculates the position's aggregate values
+     (total_shares, total_all_in_cost, blended_purchase_price) — WITHOUT touching any
+     existing DividendTranche.total_amount
+```
+
+**Acceptance Criteria**
+
+- [ ] `total_shares` = SUM(shares) across non-deleted lots (BR-010); `total_all_in_cost` = SUM(all_in_cost) across non-deleted lots (BR-011); `blended_purchase_price` = total_initial_amount / total_shares
+- [ ] **P0 critical invariant:** existing `DividendTranche.total_amount` and `qualifying_shares` values on the position are unchanged by this operation — verified by the CI-001/BR-009/EC-022 regression test (see BE-3.1 for the full invariant definition)
+- [ ] Numeric example from BAS US-004 passes: adding a 2,000-share lot at RM9.00 to an existing 5,000-share CIMB position brings total shares to 7,000, total all-in cost to RM60,037.87, and leaves a previously-stored RM1,000.00 dividend tranche untouched
+- [ ] Broker for the new lot defaults to the position's existing default broker but is overridable per lot
+
+**Definition of Done**
+
+- [ ] Regression test explicitly named after EC-022 exists in the automated suite and is treated as a P0/blocking test — this is the single most safety-critical test in the codebase per BAS §14
+- [ ] Position aggregates are computed at query time, never stored redundantly on the Position row (architecture ADR-004, §12.3 HIGH-R-006)
+
+**Dependencies & Integrations**
+
+- Shares `portfolio/calculator.py` with BE-2.1
+
+**Technical Constraints**
+
+- Same Decimal/NUMERIC constraints as BE-2.1
+
+---
+
+## BE-2.3 — Edit Position / Lot with Optimistic Locking
+
+**FR-005 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a Lot exists with version=1
+When the user PATCHes shares, purchase_price, purchase_date, and/or broker_id, submitting
+     version=1
+Then the server recalculates all fee fields, writes the previous values to audit_log,
+     increments version to 2, and returns the updated Lot — but if another session had
+     already updated the Lot to version=2, the request is rejected with 409
+```
+
+**Acceptance Criteria**
+
+- [ ] `UPDATE lots SET ..., version = version + 1 WHERE id = ? AND version = <submitted_version>`; zero rows affected → HTTP 409 `{"error": "version_conflict", "message": "This record was modified by another session. Please refresh and try again."}` (EX-008, architecture §15.4)
+- [ ] Editing a lot's share count does **not** alter any existing `DividendTranche.total_amount` (EC-015) — the dashboard/API response includes a notice that dividend records were not changed
+- [ ] `PATCH /api/v1/portfolio/positions/{id}` covers metadata only (category_tag, notes); lot financial fields are edited via `PATCH /api/v1/portfolio/positions/{id}/lots/{lot_id}`
+- [ ] Accessing or editing a position/lot owned by another user returns 404, never 403 or a differentiated error (BAS §9 URL-level enforcement; API security review AA-001–009)
+- [ ] VR-004/005/006 re-validated on edit exactly as on create
+- [ ] `audit_log` entry `LOT_UPDATED` (or `POSITION_UPDATED` for metadata edits) records previous and new values
+
+**Definition of Done**
+
+- [ ] Concurrent-edit integration test: two simultaneous PATCH requests against the same `version` — exactly one succeeds, the other receives 409
+- [ ] EC-015 regression test confirms dividend totals are untouched by a lot edit
+
+**Dependencies & Integrations**
+
+- BE-2.1 calculator, BE-3.x dividend endpoints (for the invariant check)
+
+**Technical Constraints**
+
+- `version INTEGER` column required on `Lot` (already in physical schema, architecture §8.3/§12.1)
+
+---
+
+## BE-2.4 — Delete Position (Cascading Soft-Delete)
+
+**FR-006 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a Position has 2 lots and 3 dividend tranches
+When the user DELETEs /api/v1/portfolio/positions/{id} after confirming
+Then the Position, its Lots, and its DividendTranches are all soft-deleted
+     (is_deleted=true, deleted_at=now()), and portfolio summary totals are recalculated
+     to exclude them
+```
+
+**Acceptance Criteria**
+
+- [ ] Soft-delete only — no physical row deletion at this layer (A-010); records remain for audit/PDPA export until account-level hard-delete
+- [ ] Cascade covers all active Lots and DividendTranches under the Position in a single transaction
+- [ ] `audit_log` entry `POSITION_DELETED` recorded (architecture §14.7)
+- [ ] EC-006: attempting to log a dividend against a soft-deleted position (bypassing the UI) returns 404
+- [ ] EC-001 exception path: re-adding the same stock code after a soft-delete creates a **new** Position (the old soft-deleted one is not resurrected)
+
+**Definition of Done**
+
+- [ ] Deletion is idempotent and fully reversible only via direct DB access (no "undo" UI at V1, consistent with BR — deletion confirmation copy is explicit that it "cannot be undone")
+
+**Dependencies & Integrations**
+
+- None beyond BE-2.1–2.3
+
+**Technical Constraints**
+
+- Soft-deleted rows must be excluded from every dashboard/aggregate query via `WHERE is_deleted = false` — missing this filter anywhere is a correctness bug, not just a display issue (it would corrupt yield/cost totals)
+
+---
+
+## FE-2.1 — Add Position Form with Live Fee Preview
+
+**FR-003 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user is on the "Add Position" form
+When they enter stock, shares, price, date, and broker
+Then a live, client-side fee breakdown (brokerage / clearing / stamp duty / all-in cost)
+     renders instantly using decimal.js, matching what the server will compute and store
+```
+
+**Acceptance Criteria**
+
+- [ ] Client-side preview uses `decimal.js` — never native JS floating point — to avoid a preview/actual mismatch that would undermine user trust (PRD Principle 1: Accuracy Before Features, Principle 4: Trust Through Transparency)
+- [ ] Every summary number (all-in cost) has a visible drill-down to its fee components (Principle 4 — no black-box numbers)
+- [ ] Stock autocomplete calls `GET /api/v1/stocks` (60-minute TTL cache per architecture §12.4) and falls back to free-text entry with server-side validation on submit (R-009 mitigation)
+- [ ] Inline errors match VR-003/004/005/006 copy exactly
+- [ ] EC-001 duplicate-stock flow: submitting a stock already in the portfolio shows the "added to existing position" notice instead of erroring
+
+**Definition of Done**
+
+- [ ] Client preview values verified against server response in an integration test — any divergence is a P0 bug given the product's core "provably accurate" positioning
+
+**Dependencies & Integrations**
+
+- BE-2.1, `GET /api/v1/stocks`, `GET /api/v1/brokers`
+
+**Technical Constraints**
+
+- Client fee preview is **display-only** — the form always submits raw inputs (shares, price, broker) and lets the server compute and persist authoritative fee values (P-003); the client must never submit its own computed `all_in_cost`
+
+---
+
+## FE-2.2 — Add Lot to Existing Position UI
+
+**FR-004 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user is viewing an existing position's detail page
+When they click "Add Lot" and submit shares/price/date/broker
+Then the position detail view updates to show the new blended cost basis and total
+     shares, and a confirmation clarifies that historical dividend records are unaffected
+```
+
+**Acceptance Criteria**
+
+- [ ] Broker field pre-fills to the position's existing default but is editable per lot (BR-003 — brokerage is per-transaction, so a different broker per lot is a valid scenario)
+- [ ] Blended purchase price and updated all-in cost render immediately after submission (SWR revalidation)
+
+**Definition of Done**
+
+- [ ] Verified against BAS US-004 acceptance criteria numerically in a component/integration test
+
+**Dependencies & Integrations**
+
+- BE-2.2
+
+**Technical Constraints**
+
+- None beyond FE-2.1's shared fee-preview components
+
+---
+
+## FE-2.3 — Edit Position / Lot UI with Conflict Handling
+
+**FR-005 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user opens the edit form for a lot
+When they submit changes and the server returns a 409 version conflict
+Then the UI shows "This record was updated by another session. Please refresh the page
+     to see the latest values before making changes." and reloads current values on refresh
+```
+
+**Acceptance Criteria**
+
+- [ ] `version` is submitted transparently with every PATCH (not user-visible/editable)
+- [ ] A dashboard/position notice appears after a share-count edit: "Position updated. Dividend records were not changed." (EC-015)
+- [ ] Accessing another user's position via a crafted URL renders a generic 404 page — no information disclosure
+
+**Definition of Done**
+
+- [ ] EX-008 concurrent-edit scenario manually tested with two browser sessions
+
+**Dependencies & Integrations**
+
+- BE-2.3
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+## FE-2.4 — Delete Position Confirmation Flow
+
+**FR-006 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user clicks "Delete Position" on a position with 2 lots and 3 dividend tranches
+When the confirmation dialog appears
+Then it reads "This will delete [Stock Name] and all 2 lots and 3 dividend records.
+     This cannot be undone." and only proceeds on explicit confirmation
+```
+
+**Acceptance Criteria**
+
+- [ ] Dialog dynamically interpolates the actual lot/tranche counts for the specific position
+- [ ] Cancelling leaves the position untouched and returns to the dashboard
+- [ ] Portfolio summary (total cost, blended yield) visibly updates immediately after confirmed deletion
+
+**Definition of Done**
+
+- [ ] Reusable `ConfirmDialog` component (already scoped in architecture's frontend structure, §7.2) used consistently for this and all other destructive actions (dividend delete, account delete)
+
+**Dependencies & Integrations**
+
+- BE-2.4
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+# Epic 3 — Dividend Tracking
+
+## BE-3.1 — Log Dividend Tranche (qualifying_shares Invariant)
+
+**FR-009 · Priority: Must Have — P0 CRITICAL**
+
+> This story implements the single most safety-critical business rule in the product (BR-009/BR-027, CI-001). The Excel predecessor's core defect — dividend totals silently inflating when new shares are purchased — must not be reproduced. Do not begin this story without reading BR-009 and BR-027 in full.
+
+**Developer Action Plan**
+
+```gherkin
+Given a position has 5,000 total shares and no dividends logged
+When the user POSTs tranche_label="1st", per_share_amount=0.20, payment_date, and either
+     accepts the default qualifying_shares=5000 or overrides it
+Then the server stores qualifying_shares and computes total_amount = per_share_amount ×
+     qualifying_shares AT THIS MOMENT, and total_amount will NEVER be recomputed from a
+     future position_total_shares value — only an explicit edit to this tranche changes it
+```
+
+**Acceptance Criteria**
+
+- [ ] `qualifying_shares` defaults to current `position_total_shares` at logging time but is user-overridable, bounded `1 ≤ qualifying_shares ≤ position_total_shares` at time of entry (VR-011)
+- [ ] `total_amount = per_share_amount × qualifying_shares`, rounded to 2dp (BR-025), is a **stored** column — never a computed/derived value at read time (BR-009, architecture §12.3 explicitly rules out a stored `yield_percentage` but `total_amount` on `DividendTranche` IS stored deliberately, per BR-009's fix)
+- [ ] **P0 regression test (mandatory, cannot be skipped per BAS §14):** logging a 1st tranche (qualifying_shares=5000, total_amount=RM1,000 stored), then adding a new 2,000-share lot, must leave the 1st tranche's `total_amount` at exactly RM1,000.00 — this is EC-022 verbatim
+- [ ] BR-014: a position may have at most 8 `DividendTranche` rows per calendar `year`; the 9th attempt is rejected with "Maximum of 8 dividend tranches per year reached for [Stock] ([Year])"
+- [ ] VR-008 (per_share_amount >0, ≤6dp), VR-009 (payment_date ≤30 days future), VR-010 (ex_dividend_date ≤ payment_date if present), VR-012 (year 1990–current+1) all enforced
+- [ ] Position yield recalculated as `SUM(DividendTranche.total_amount for year=current) / position_total_all_in_cost` (BR-008, BR-012) — using **all-in cost**, never the pre-fee initial amount
+- [ ] Portfolio blended yield = `SUM(all positions' income) / SUM(all positions' cost)` — weighted, not an arithmetic average of individual position yields (BR-013)
+- [ ] EC-023: when a user deliberately sets qualifying_shares below the current position total, the tranche detail view surfaces both numbers ("5,000 qualifying shares (current total: 7,000)") with no error — this is a valid, intentional state
+- [ ] `audit_log` entry `DIVIDEND_CREATED`
+
+**Definition of Done**
+
+- [ ] Unit test: `total_amount` is stored and provably immutable across a subsequent lot-add operation (cross-references BE-2.2's invariant test — these two tests should assert the same fact from both directions)
+- [ ] Unit test: yield calculation uses all-in cost, with the explicit negative assertion that it does NOT equal `income / pre_fee_initial_amount` (BAS US-011)
+- [ ] Code review checklist item: any PR touching `DividendTranche.total_amount` must be explicitly reviewed against BR-009/BR-027 (architecture P-004)
+
+**Dependencies & Integrations**
+
+- Depends on Position/Lot aggregates from Epic 2 for `position_total_shares` lookup at logging time
+
+**Technical Constraints**
+
+- `per_share_amount` is `NUMERIC(12,6)`; `total_amount` is `NUMERIC(14,2)` (architecture §12.3)
+- This is the one field in the entire schema where "derived at query time" (the architecture's general pattern, ADR-004) is deliberately **not** followed — the schema comment on this column must explain why, so a future engineer doesn't "fix" it into a derived value
+
+---
+
+## BE-3.2 — Edit / Delete Dividend Tranche
+
+**FR-010 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a stored tranche has per_share_amount=0.20, qualifying_shares=5000, total_amount=1000.00
+When the user PATCHes per_share_amount to 0.22 (submitting the current version)
+Then total_amount recalculates to 0.22 × 5000 = 1100.00 using the EXISTING stored
+     qualifying_shares — it does not re-read the live position_total_shares
+```
+
+**Acceptance Criteria**
+
+- [ ] Editing `per_share_amount` recomputes `total_amount` using the tranche's own stored `qualifying_shares`, never the current position total (BAS US-012)
+- [ ] Editing `qualifying_shares` directly recomputes `total_amount` with the new qualifying_shares × the existing `per_share_amount`; still bounded ≤ position_total_shares at time of edit (VR-011 "on edit" clause)
+- [ ] Delete is a soft-delete; position/portfolio yield recalculates with the tranche excluded
+- [ ] Optimistic locking via `version` column, identical conflict handling to BE-2.3 (EX-008)
+- [ ] `audit_log` entries `DIVIDEND_UPDATED` / `DIVIDEND_DELETED` capture previous and new values
+
+**Definition of Done**
+
+- [ ] Both BAS US-012 Gherkin scenarios (edit per_share_amount, edit qualifying_shares) pass as automated tests with the exact numeric expectations
+
+**Dependencies & Integrations**
+
+- BE-3.1
+
+**Technical Constraints**
+
+- Same NUMERIC/Decimal constraints as BE-3.1
+
+---
+
+## BE-3.3 — Dividend Calendar Aggregation
+
+**FR-013 · Priority: Should Have (V1)**
+
+**Developer Action Plan**
+
+```gherkin
+Given a portfolio has dividend tranches with various ex_dividend_date and payment_date values
+When the client GETs the dividend calendar view
+Then entries are returned in ascending chronological order by ex_dividend_date (or
+     payment_date if no ex-date), scoped to future dates plus the trailing 30 days
+```
+
+**Acceptance Criteria**
+
+- [ ] Each entry includes stock name, tranche label, ex-date, payment date, per_share_amount, and the **stored** total_amount (not re-derived) — display must make clear this reflects the qualifying_shares basis at logging time (FR-013 step 3 fix)
+- [ ] Past dates flagged "Paid"; upcoming dates within 7 days flagged for highlighting
+- [ ] Empty state (no ex-dates recorded) returns a payload the frontend can render as the guidance message
+
+**Definition of Done**
+
+- [ ] Query correctly filters soft-deleted tranches (`is_deleted=false`)
+
+**Dependencies & Integrations**
+
+- BE-3.1 for the underlying data
+
+**Technical Constraints**
+
+- None beyond standard read-path query performance (indexed on `dividend_tranches(position_id, year, is_deleted)` per architecture §8.3)
+
+---
+
+## FE-3.1 — Log Dividend Tranche Form
+
+**FR-009 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user opens "Add Dividend" on a position with 5,000 current shares
+When the form loads
+Then the "Qualifying Shares" field is pre-populated with 5,000 and shows guidance text:
+     "This is the number of shares you held before the ex-dividend date. Change this if
+     you held fewer shares than your current total."
+```
+
+**Acceptance Criteria**
+
+- [ ] Tranche label field suggests the next available label (1st–8th) and blocks submission once 8 are already used for the year, with the exact BAS error copy
+- [ ] Qualifying-shares guidance text matches BAS Workflow 4 wording verbatim — this field is the UI's primary defense against the BR-009 class of user error
+- [ ] Yield displayed immediately after submission, computed from the response (not client-recomputed) to avoid any drift from the authoritative server value
+
+**Definition of Done**
+
+- [ ] Manual QA pass specifically exercises EC-023 (override qualifying_shares below current total) and confirms the transparent display of both numbers
+
+**Dependencies & Integrations**
+
+- BE-3.1
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+## FE-3.2 — Edit / Delete Dividend Tranche UI
+
+**FR-010 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user opens a logged tranche for editing
+When they change per_share_amount or qualifying_shares
+Then the recalculated total_amount and updated yield render after save, and a delete
+     action requires the standard confirm-dialog ("Delete this dividend record? This
+     cannot be undone.")
+```
+
+**Acceptance Criteria**
+
+- [ ] Attempting to set qualifying_shares above the current position total shows: "Qualifying shares cannot exceed the position's current total shares ([N])"
+- [ ] Uses the shared `ConfirmDialog` component (consistent with FE-2.4)
+
+**Definition of Done**
+
+- [ ] BAS US-012 error scenario covered
+
+**Dependencies & Integrations**
+
+- BE-3.2
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+## FE-3.3 — Dividend Calendar View
+
+**FR-013 · Priority: Should Have (V1)**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user has logged dividends with ex-dates across several positions
+When they open the Dividend Calendar tab
+Then entries render chronologically with "Paid" badges on past dates and highlighting
+     on entries due within 7 days
+```
+
+**Acceptance Criteria**
+
+- [ ] Empty state renders: "Add ex-dates when logging dividends to see your payment schedule here."
+- [ ] Each entry is legible on a 375px viewport
+
+**Definition of Done**
+
+- [ ] Visual QA against BAS US-017 happy-path and empty-state scenarios
+
+**Dependencies & Integrations**
+
+- BE-3.3
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+# Epic 4 — Dashboard & Sell Calculator
+
+## BE-4.1 — Portfolio Dashboard Aggregate Endpoint
+
+**FR-011 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given an authenticated user with 16 positions, lots, dividends, and price snapshots
+When the client GETs /api/v1/portfolio/dashboard
+Then the response includes a summary (total all-in cost, total YTD dividend income,
+     portfolio blended yield, last price refresh timestamp) plus a per-position array
+     with all derived fields, computed fresh at query time, within the 3-second NFR
+```
+
+**Acceptance Criteria**
+
+- [ ] Per-position fields: stock name/code, category_tag, total_shares, blended_purchase_price, total_all_in_cost, current_price (with `last_refreshed_at` for staleness), current_market_value, unrealised_pnl, dividend_income_ytd, dividend_yield — matching the Position entity's "derived (runtime) aggregates" table in BAS §7
+- [ ] Positions with no dividend tranches show yield as null/"—", not 0% (BAS US-013 alternate scenario)
+- [ ] EC-005: positions with no price data show market value/P&L as null/"—", not RM0.00
+- [ ] EC-009: zero all-in-cost positions show yield as null with a "cost basis is zero" indicator rather than throwing a division error
+- [ ] EC-010: yield >100% is calculated and returned as-is, no error — the frontend may show a soft warning
+- [ ] All aggregates computed at query time from stored `Lot`/`DividendTranche` rows — no denormalized/cached aggregate column on `Position` (ADR-004, HIGH-R-006)
+- [ ] Response performance: <3 seconds for up to 50 positions (PRD/BAS NFR, load-tested)
+
+**Definition of Done**
+
+- [ ] Load test with 50 positions × 3 lots × 8 tranches confirms the 3-second budget
+- [ ] Query uses the indexes specified in architecture §8.3 (`lots(position_id, is_deleted)`, `dividend_tranches(position_id, year, is_deleted)`, `price_snapshots(stock_code, trading_date)`)
+
+**Dependencies & Integrations**
+
+- Epic 2 (positions/lots), Epic 3 (dividends), Epic 5 (price snapshots)
+
+**Technical Constraints**
+
+- All computation in Python `Decimal`; response schema serializes monetary fields as strings, not JSON numbers (API security review FC-001)
+
+---
+
+## BE-4.2 — Sell Scenario Calculator
+
+**FR-012 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a position has 5,000 shares, all-in buy cost RM41,996.47, broker "Maybank Investment"
+When the client POSTs to /api/v1/portfolio/positions/{id}/sell-scenario with an optional
+     shares_to_sell and broker override
+Then the server generates scenario rows at current_price + [0.01…0.05, then 0.10…0.70 in
+     0.05 steps], computes net proceeds and profit/loss per row using the same fee engine
+     as buy-side, and flags the lowest break-even row
+```
+
+**Acceptance Criteria**
+
+- [ ] Sell-side fees use identical broker rules to buy-side (BR-004): `sell_brokerage = MAX(gross × rate, min)` or flat; `sell_clearing = gross × 0.0003`; `sell_stamp_duty = ROUNDUP(gross/1000, 0)`
+- [ ] Reference case from BAS US-015/016 passes numerically: CIMB @ RM8.42 → gross RM42,100, net ≈RM42,002.27, P/L ≈+RM5.80, flagged as break-even
+- [ ] BR-024/EC — partial sale: buy-cost basis = `(shares_to_sell / total_shares) × total_all_in_cost` (proportional weighted average, explicitly NOT FIFO/LIFO — NG-009)
+- [ ] A-006 (⚠ pending confirmation, OQ-005): default sell broker for a multi-lot position with different brokers is the most recently created active lot's broker; user can override without altering stored position data
+- [ ] Response always includes the non-dismissable disclosure text: "Calculations are informational only. BursaTrack is not a financial advisor. Settlement on Bursa Malaysia is T+2..." (BR-020) and the general disclaimer (BR-021)
+- [ ] EC-009: zero all-in-cost position — profit/loss = net proceeds; yield shown as "—"
+- [ ] Calculator results are **not persisted** — stateless computation per request
+
+**Definition of Done**
+
+- [ ] Numeric test suite matches every worked example in BAS BR-004/BR-024 and US-015/016 exactly, to the cent
+
+**Dependencies & Integrations**
+
+- Shares `portfolio/calculator.py` with Epic 2 (BR-004 reuses the exact buy-side fee functions)
+
+**Technical Constraints**
+
+- Same Decimal/NUMERIC discipline as all other calculation endpoints
+
+---
+
+## FE-4.1 — Dashboard UI
+
+**FR-011 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user logs in
+When the dashboard loads
+Then the summary header and position table render within 3 seconds, sorted by dividend
+     yield descending by default, with re-sortable columns and stale-price indicators
+     where applicable
+```
+
+**Acceptance Criteria**
+
+- [ ] Sort preference persists across the session (BAS US-014)
+- [ ] Stale positions (per `last_refreshed_at` > 28h, architecture §15.1) show a stale icon and the portfolio-level banner text from EX-001/EX-002 when applicable
+- [ ] Positions with null yield/market value render "—", never a misleading 0
+- [ ] Loads correctly for both trial and paid accounts; trial-expired accounts render the same table in read-only mode (no add/edit/delete affordances) per the Permission Matrix (BAS §9)
+
+**Definition of Done**
+
+- [ ] Manual test with 50 seeded positions confirms sub-3-second perceived load and correct default sort
+
+**Dependencies & Integrations**
+
+- BE-4.1, `SubscriptionGate` component (Epic 7) for the read-only trial-expired state
+
+**Technical Constraints**
+
+- SWR with stale-while-revalidate; revalidates on window focus and after any write mutation elsewhere in the app (architecture §12.4)
+
+---
+
+## FE-4.2 — Sell Scenario Calculator UI
+
+**FR-012 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user opens the sell calculator for a position
+When the scenario table renders
+Then the break-even row is visually highlighted, the T+2/disclaimer text is permanently
+     visible (not dismissable), and the user can enter a custom price or adjust shares-to-sell
+```
+
+**Acceptance Criteria**
+
+- [ ] Disclosure text cannot be dismissed or hidden by the user (BR-020/BR-021 — compliance requirement, not a UX nicety)
+- [ ] Custom price entry adds a row computed via the same endpoint, not a separate client-only formula
+- [ ] Partial-sale slider/input updates all rows' proportional cost basis live
+
+**Definition of Done**
+
+- [ ] Verified the disclaimer renders on every result state, including custom-price and partial-sale variants
+
+**Dependencies & Integrations**
+
+- BE-4.2
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+# Epic 5 — Pricing & Market Data
+
+## BE-5.1 — Daily Automated Price Refresh Cron
+
+**FR-007 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given it is a Bursa Malaysia trading day
+When the Render cron job refresh_prices.py fires at 09:30 UTC (5:30 PM MYT)
+Then the job fetches yfinance prices for every unique stock_code across active
+     (non-deleted) lots, in parallel with a concurrency limit, and UPSERTs
+     PriceSnapshot rows with source="automated"
+```
+
+**Acceptance Criteria**
+
+- [ ] Trading-day check against a `system_config`-stored Bursa holiday calendar (JSON array); job exits cleanly with a Sentry check-in on non-trading days, without touching `last_refreshed_at`
+- [ ] Process lock via `system_config.price_refresh_lock`: a run already in progress within the last 2 hours prevents a duplicate run (HIGH-R-004)
+- [ ] Wall-clock timeout of 60 minutes wraps the entire job; on timeout, the lock clears and remaining stocks are marked stale
+- [ ] Parallel fetch via `asyncio.gather` with `semaphore(10)` (HIGH-R-004) — not fully sequential, not unbounded
+- [ ] Per-stock retry: 2 retries with 5s/15s exponential backoff; failures on one stock never abort others (per-stock isolation, R-001)
+- [ ] Price validity guard: reject prices ≤0 or deviating >75% from the prior snapshot (configurable via `system_config.price_deviation_max_pct`, default 75 — MED-R-006, not the earlier 50% draft); rejected prices are logged as `CORPORATE_ACTION_CANDIDATE` for admin review, not silently discarded
+- [ ] If >50% of stocks fail in a run, a Sentry CRITICAL alert fires
+- [ ] Job reports a Sentry Cron Monitoring check-in on both success and failure paths
+
+**Definition of Done**
+
+- [ ] Integration test against a mocked yfinance client covers: full success, partial failure, complete outage, invalid-price rejection, holiday no-op, and lock-contention skip
+- [ ] Batch timing benchmark: <30 seconds for 16 stocks (BAS §14 performance requirement)
+
+**Dependencies & Integrations**
+
+- `system_config` table (holiday calendar, deviation threshold, refresh lock) — Epic 9 seed data
+- yfinance Python library, invoked only from this cron script, never from the request path (architecture §11.1)
+
+**Technical Constraints**
+
+- `PriceSnapshot` writes must be idempotent UPSERTs keyed on `(stock_code, trading_date)`
+- Price fetching is isolated behind a `PriceProvider` interface in `pricing/service.py` so yfinance can be swapped later without touching calling code (R-001 mitigation, V2 evolution path)
+
+---
+
+## BE-5.2 — Price Outage Handling & Manual Override
+
+**FR-008 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given the price feed fails for 2 of 16 stocks in a refresh run
+When a user views their dashboard within 5 minutes of the failed refresh
+Then only the 2 affected positions show a stale indicator and a manual price entry
+     field; all other positions show current, unaffected prices
+```
+
+**Acceptance Criteria**
+
+- [ ] `GET /api/v1/pricing/prices` returns price + source (`automated`/`manual`/`stale`) + `last_refreshed_at` per requested stock code
+- [ ] `POST /api/v1/pricing/manual-override` creates a `PriceSnapshot` with `source="manual"`, `created_by_user_id=<user>`, current timestamp; position recalculates immediately using this price
+- [ ] BR-023: the next successful automated refresh supersedes any manual override for that stock — `source` reverts to `automated`
+- [ ] Manual override is blocked for trial-expired (read-only) accounts (EC-020) — same permission gate as all other write actions
+- [ ] EX-001/EX-002 banner copy matches BAS exactly, including the partial-failure variant naming the specific affected stock codes
+
+**Definition of Done**
+
+- [ ] Full outage → manual override → next-refresh-supersedes sequence covered by an integration test (mirrors BAS Integration/Scenario Tests table)
+
+**Dependencies & Integrations**
+
+- BE-5.1 for the automated side of the source-transition logic
+
+**Technical Constraints**
+
+- `PriceSnapshot` is shared system data, not per-user — a manual override by user A is visible to user B who also holds the same stock, until the next automated refresh supersedes it (BAS §7 Entity 6 note)
+
+---
+
+## FE-5.1 — Stale Data Banner & Manual Price Override UI
+
+**FR-008 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given the dashboard API response indicates 2 stocks are stale
+When the page renders
+Then a banner reads "Price data unavailable for 2 stocks — [Stock A], [Stock B]" and
+     each affected position row exposes an inline manual-price input
+```
+
+**Acceptance Criteria**
+
+- [ ] Complete-outage banner copy vs. partial-failure banner copy match EX-001/EX-002 exactly
+- [ ] Manual entry field disappears and reverts to the automated price display once superseded (BR-023) — verified via SWR revalidation after the next scheduled refresh window
+- [ ] For trial-expired accounts, the manual override field is replaced by the paywall prompt (EC-020)
+
+**Definition of Done**
+
+- [ ] Visual states for complete outage, partial outage, and override-in-effect all covered by component tests/screenshots
+
+**Dependencies & Integrations**
+
+- BE-5.2, FE-4.1 (dashboard shell)
+
+**Technical Constraints**
+
+- Staleness threshold (28 hours) is a shared frontend constant (`lib/constants.ts`), not hardcoded per component (architecture §7.2)
+
+---
+
+# Epic 6 — CSV Import & Export
+
+## BE-6.1 — CSV Import Processing (Async Job)
+
+**FR-014 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user uploads a correctly formatted CSV with 16 positions and 34 dividend rows
+When they POST to /import/csv
+Then the file passes pre-accept validation, an ImportJob(status=processing) is created,
+     a BackgroundTask performs row validation then an atomic all-or-nothing create, and
+     the client polls /import/status/{job_id} until it reads status=complete
+```
+
+**Acceptance Criteria**
+
+- [ ] Pre-accept synchronous validation (HIGH-R-009): reject >1MB with 413; require `Content-Type: text/csv`/`application/csv`; validate full UTF-8 decodability, else 400 with "File encoding error. Please save your CSV as UTF-8 before uploading." (EC-019); reject >1,000 data rows with 400
+- [ ] Phase 1 (row-level validation, all rows/sheets) must fully pass before Phase 2 begins; any failing row halts the entire import with zero records created (BR-022 atomicity) and returns a row-level error report ("Row [N], Column [X]: [specific error]")
+- [ ] Phase 2 is a single atomic DB transaction creating all Position/Lot/DividendTranche rows — partial failure rolls back completely (EX-005), with the generic "Import failed due to a system error... Your existing portfolio has not been affected" message
+- [ ] `qualifying_shares` on imported dividend rows defaults to the matching position's imported share count if the optional CSV column is absent; if present, validated ≤ that position's total imported shares (VR-013)
+- [ ] EC-007: a CSV row for a stock code already active in the portfolio is rejected at validation with the "Use 'Add Lot' instead" message (reject-only at V1 per OQ-012 — ⚠ confirm before CSV import sprint if a merge/replace mode is later required)
+- [ ] EC-008: duplicate tranche label for the same stock+year within the same file is rejected at validation
+- [ ] Import completes within 30 seconds for 500 rows (BAS §14 performance requirement)
+- [ ] Stuck-job cleanup: any `ImportJob` left in `processing` for >1 hour (e.g., due to a Render service restart mid-task) is marked `failed` by the daily `check_trial_expiry.py` job's cleanup step (HIGH-R-005), with a re-upload CTA
+- [ ] `audit_log` entry `IMPORT_COMPLETED`
+
+**Definition of Done**
+
+- [ ] Integration tests cover: happy path (16 positions/34 tranches), missing required column, encoding failure, row-count limit exceeded, duplicate-stock rejection, duplicate-tranche-label rejection, mid-transaction failure rollback
+- [ ] Rate limited to 2/minute per authenticated user (architecture §14.4)
+
+**Dependencies & Integrations**
+
+- Reuses `portfolio/calculator.py` for fee computation per imported lot — must not reimplement fee logic separately
+- `ImportJob` table and polling endpoint
+
+**Technical Constraints**
+
+- Temp file storage via `tempfile.NamedTemporaryFile`, deleted on completion or error — no imported file persists beyond job processing
+- CSV injection defence (IV-008 scope note): formula-prefix characters (`=`, `+`, `-`, `@`) are only a concern for the _outbound_ template/export files (BE-6.2, BE-8.1), not inbound import parsing
+
+---
+
+## BE-6.2 — CSV Template Download
+
+**FR-015 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user is on the Import page
+When they click "Download Template"
+Then a static file BursaTrack_Import_Template.csv downloads, containing headers, a guide
+     row, and one example row for both the Positions/Lots and Dividend Tranches sheets
+```
+
+**Acceptance Criteria**
+
+- [ ] Served as a static frontend asset (ADD-013 decision — no dedicated API endpoint), consistent with the API design record's resolution of PD-000
+- [ ] Columns match the CSV Import Template Specification exactly (BAS §7), including the optional `qualifying_shares` column on the Dividends sheet
+- [ ] Any example/guide cell beginning with `=`, `+`, `-`, `@` is quoted/escaped to prevent formula injection when opened in Excel (HIGH-R-009 CSV injection defence)
+
+**Definition of Done**
+
+- [ ] Template file diffed against the BAS Sheet 1 / Sheet 2 column specification for exact match
+
+**Dependencies & Integrations**
+
+- None (static asset)
+
+**Technical Constraints**
+
+- Must be kept in sync with BE-6.1's validation rules — if a column is added/removed from the import validator, the template must be updated in the same PR
+
+---
+
+## FE-6.1 — CSV Import UI
+
+**FR-014 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user has uploaded a CSV file
+When the server returns 202 Accepted with a job_id
+Then the UI polls /import/status/{job_id} every 2 seconds and shows a progress state,
+     then either a success banner ("Import complete — N positions and M dividend records
+     imported") or a row-level error report
+```
+
+**Acceptance Criteria**
+
+- [ ] Error report is scannable — each row error shown with row number, column, and message, matching BE-6.1's format
+- [ ] A failed/timed-out job (per HIGH-R-005 cleanup) shows the re-upload CTA
+- [ ] Uses the shared `ImportStatusPoller` component already scoped in the architecture's frontend structure (§7.2)
+
+**Definition of Done**
+
+- [ ] Polling stops correctly on both `complete` and `failed` terminal states (no infinite polling)
+
+**Dependencies & Integrations**
+
+- BE-6.1
+
+**Technical Constraints**
+
+- Poll interval fixed at 2 seconds per architecture §10.3 sequence diagram
+
+---
+
+## FE-6.2 — CSV Template Download Button
+
+**FR-015 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user is on the Import page
+When they click "Download Template"
+Then the browser downloads BursaTrack_Import_Template.csv without a network round-trip
+```
+
+**Acceptance Criteria**
+
+- [ ] Static asset served directly, no loading state needed
+
+**Definition of Done**
+
+- [ ] Link verified on the Import page in both empty-portfolio and existing-portfolio states
+
+**Dependencies & Integrations**
+
+- BE-6.2
+
+**Technical Constraints**
+
+- None
+
+---
+
+# Epic 7 — Subscription & Billing
+
+## BE-7.1 — Stripe Checkout & Webhook Processing
+
+**FR-016 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a trial or trial-expired user clicks "Subscribe"
+When the client POSTs to /subscription/checkout
+Then the server creates a Stripe Checkout Session and returns its URL; upon payment
+     completion, Stripe's checkout.session.completed webhook activates the account
+     idempotently
+```
+
+**Acceptance Criteria**
+
+- [ ] `POST /webhooks/stripe` verifies the `Stripe-Signature` header before trusting any payload (OW-010 — never trust unsigned webhook data)
+- [ ] Idempotency: every webhook `event.id` is checked against `processed_webhook_events` before processing; a re-delivered event returns 200 with no side effect (OTQ-008)
+- [ ] Events handled: `checkout.session.completed` → `account_status=active`, `subscription_start_date` set, `subscription_renewal_date` set from `current_period_end`; `invoice.payment_succeeded` → confirms active, refreshes `subscription_renewal_date` from `current_period_end` (not by adding a fixed interval — LOW-R-005); `invoice.payment_failed` → `account_status=grace_period`, user notified by email; `customer.subscription.deleted` → `account_status=trial_expired`
+- [ ] No custom renewal cron job exists — renewal is entirely Stripe-native (`collection_method=charge_automatically`); this was a deliberate architecture correction (CRIT-R-003) to eliminate double-charge risk
+- [ ] Webhook handler responds within Stripe's 30-second requirement
+- [ ] Cancellation flow: `POST /subscription/cancel` (or equivalent) schedules the transition to `trial_expired` at period end without deleting any portfolio data (BR-018) — no proration/refund logic at V1 (EC-018, ⚠ OQ-010 pending Product+Legal sign-off on refund policy)
+- [ ] `audit_log` entries `SUBSCRIPTION_ACTIVATED` / `SUBSCRIPTION_CANCELLED`
+
+**Definition of Done**
+
+- [ ] Idempotent re-delivery test: replaying the same webhook event twice produces exactly one state transition
+- [ ] Stripe test-mode keys used in all non-production environments (MED-R-001) — verified in environment variable configuration, never live keys outside production
+
+**Dependencies & Integrations**
+
+- Stripe SDK, `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` env vars
+- Resend for grace-period/failure notification emails
+
+**Technical Constraints**
+
+- Rate limit: `POST /webhooks/stripe` at 100/minute per IP (MED-R-008) — higher than user-facing endpoints since Stripe may burst-deliver
+- Currency: MYR only; no FPX support at V1 (R-004, known gap — document, do not attempt to build)
+
+---
+
+## BE-7.2 — Trial Expiry & Access Gating
+
+**FR-016 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user's trial_expiry_date has passed
+When the daily check_trial_expiry.py cron runs at 01:00 UTC
+Then the account transitions to trial_expired, and subsequent write requests
+     (add/edit/delete position, dividend, manual price override, CSV import) are
+     rejected while GET/read requests remain available
+```
+
+**Acceptance Criteria**
+
+- [ ] `UPDATE users SET account_status='trial_expired' WHERE account_status='trial' AND trial_expiry_date <= CURRENT_DATE` — idempotent, safe to re-run same-day
+- [ ] Permission Matrix (BAS §9) enforced server-side on every write endpoint: trial-expired users get a paywall-class rejection on add/edit/delete/import/manual-override, but retain read access to dashboard, sell calculator (read-only), dividend calendar, CSV template download, PDPA export, and deletion request
+- [ ] Trial length is 14 calendar days from registration (BR-017) ⚠ _STAKEHOLDER SIGN-OFF PENDING (OQ-001 — confirm 14 days is final)_
+
+**Definition of Done**
+
+- [ ] Every write endpoint has an explicit test asserting rejection for `trial_expired` status, not just an assumed inherited check
+
+**Dependencies & Integrations**
+
+- Cron infrastructure (Epic 9)
+
+**Technical Constraints**
+
+- Enforcement must happen at the API layer on every request — do not rely solely on frontend route guards, since API endpoints are directly reachable
+
+---
+
+## FE-7.1 — Paywall / Subscribe UI
+
+**FR-016 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user's trial has expired
+When they log in
+Then they see their portfolio in read-only mode with a paywall prompt, and clicking
+     "Subscribe" redirects to Stripe Checkout; on return, the UI polls subscription
+     status until it flips to active (or shows a "please wait" message after 30s)
+```
+
+**Acceptance Criteria**
+
+- [ ] Matches architecture §10.4's polling pattern exactly: poll every 2s, up to 15 attempts, before falling back to "Payment processing - please wait a moment and refresh" (HIGH-R-008 — webhook may not have arrived yet when the user returns from Stripe)
+- [ ] Read-only mode hides/disables all write affordances (add position, add dividend, delete, import, manual override) consistent with the Permission Matrix
+- [ ] `SubscriptionGate` wraps all protected routes and redirects trial-expired write attempts to the paywall
+
+**Definition of Done**
+
+- [ ] Manual test of the full subscribe round-trip against Stripe test mode, including the polling fallback message
+
+**Dependencies & Integrations**
+
+- BE-7.1, BE-7.2
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+## FE-7.2 — Subscription Management (Cancel) UI
+
+**FR-016 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a paying subscriber with renewal on 2026-08-01
+When they click "Cancel Subscription" on 2026-07-15
+Then they see "Your subscription ends on 1 Aug 2026. Your data will be preserved." and
+     retain full access until that date
+```
+
+**Acceptance Criteria**
+
+- [ ] Confirmation copy matches BAS US-020 exactly, with the actual renewal date interpolated
+- [ ] Billing status component shows current plan and next renewal/expiry date at all times (`BillingStatus.tsx` per architecture §7.2)
+
+**Definition of Done**
+
+- [ ] Verified against BAS US-020 cancel scenario
+
+**Dependencies & Integrations**
+
+- BE-7.1
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+# Epic 8 — PDPA Compliance & Admin
+
+## BE-8.1 — PDPA Data Export
+
+**FR-018 · Priority: Must Have (PDPA compliance obligation)** ⚠ _STAKEHOLDER SIGN-OFF PENDING (OQ-008: legal confirmation of V1 launch requirement)_
+
+**Developer Action Plan**
+
+```gherkin
+Given an authenticated user (any account status) clicks "Download My Data"
+When the client GETs /api/v1/account/export
+Then the server assembles a single JSON file containing all the user's personal and
+     financial data (excluding password_hash, token_version, internal FKs, and
+     soft-deleted records) and streams it as a synchronous file download
+```
+
+**Acceptance Criteria**
+
+- [ ] Export scope matches architecture §10.7 exactly: User, Portfolio, Position, Lot, DividendTranche, custom BrokerConfig, ImportJob, AuditLog (metadata/IP excluded) — shared `PriceSnapshot` market data is explicitly excluded (it isn't personal data)
+- [ ] Filename: `bursatrack-export-{date}.json`
+- [ ] Synchronous, in-memory generation — no async job needed at V1 data volumes (<~400 records/user)
+- [ ] Available regardless of account status, including `trial_expired` and `pending_deletion`-eligible states (per BAS Permission Matrix — export access is broader than write access)
+- [ ] `audit_log` entry `DATA_EXPORT_DOWNLOADED` recorded before the response streams
+- [ ] Standard 60/minute authenticated rate limit applies — no special restriction needed at V1 volumes
+
+**Definition of Done**
+
+- [ ] Export content diffed field-by-field against the architecture §10.7 table to confirm no PII field is missing and no excluded field (password_hash etc.) leaks
+- [ ] Legal sign-off obtained per OQ-008 before this is marked "done" for launch purposes, even if code is complete earlier
+
+**Dependencies & Integrations**
+
+- Depends on all other domain data existing (positions, lots, dividends, broker configs, import jobs, audit log)
+
+**Technical Constraints**
+
+- `StreamingResponse` with `Content-Disposition: attachment` — do not buffer the entire export unnecessarily for larger accounts, but V1 volumes make this a non-issue in practice
+
+---
+
+## BE-8.2 — PDPA Account Deletion (30-Day Grace Period)
+
+**FR-019 · Priority: Must Have (PDPA compliance obligation)** ⚠ _STAKEHOLDER SIGN-OFF PENDING (OQ-009: legal confirmation the 30-day window satisfies right of erasure)_
+
+**Developer Action Plan**
+
+```gherkin
+Given a logged-in user types "DELETE" to confirm account deletion
+When the client POSTs /account/delete
+Then account_status becomes pending_deletion, permanent_deletion_date is set to
+     today+30 days, all sessions are invalidated (token_version incremented), a
+     cancellation email is sent, and the user is logged out and cannot log in again
+     until either cancellation or permanent deletion
+```
+
+**Acceptance Criteria**
+
+- [ ] Two-step confirmation UX contract: offer data export first ("Download My Data" / "Skip and Continue"), then require typing "DELETE" (BAS Workflow 9)
+- [ ] `GET /account/cancel-deletion?token=xxx` (within 30 days) restores the account to its pre-deletion status and clears `permanent_deletion_date`
+- [ ] `pending_deletion` accounts cannot authenticate via `/auth/login` at all (BAS Permission Matrix)
+- [ ] `process_deletions.py` cron (03:00 UTC daily) hard-deletes accounts where `permanent_deletion_date <= CURRENT_DATE`:
+  - [ ] **Pre-deletion gate (MED-R-005):** verifies the PDPA confirmation email was actually delivered (`pending_email_notifications` record with `sent_at IS NOT NULL`); if not, skips deletion and fires a Sentry CRITICAL for manual remediation — never silently deletes without proof of notification
+  - [ ] Cancels any live Stripe subscription (`cancel_at_period_end=False`) before deleting user data (MS-002)
+  - [ ] Deletes, in order, within one transaction: manual price overrides → import_jobs → processed_webhook_events → pending_email_notifications → dividend_tranches → lots → positions → portfolio → anonymises `subscription_records.user_id=NULL` (7-year accounting retention) → inserts an anonymised `system_deletion_log` row → deletes the `users` row (which CASCADEs `audit_log` automatically, per the FK design — HIGH-R-007)
+  - [ ] Idempotent: safe to re-run against a partially-deleted user from a previous failed run (MED-R-007)
+- [ ] Email address is freed for re-registration only after the hard-delete completes
+- [ ] EC-018: deletion while a subscription is active stops future billing from the request date; no prorated refund at V1 (⚠ OQ-010 — confirm with Product+Legal before launch, document in ToS)
+
+**Definition of Done**
+
+- [ ] Integration test for the full lifecycle: request deletion → cancel within window → restored; and separately, request deletion → 30 days pass → hard-deleted → email re-registrable
+- [ ] Test specifically asserts the pre-deletion notification gate blocks deletion when the confirmation email was never marked `sent_at`
+
+**Dependencies & Integrations**
+
+- Shares `pending_tokens`/cancellation-token mechanics with Epic 1
+- Stripe SDK (subscription cancellation)
+- `system_deletion_log` table
+
+**Technical Constraints**
+
+- This is the most legally sensitive job in the codebase — every deletion step must be traceable and the order matters (subscription cancellation before data deletion; deletion-log insert before the `users` row itself is removed, since some logging approaches would otherwise lose the FK target)
+
+---
+
+## BE-8.3 — Admin Fee Config & BrokerConfig Management
+
+**Priority: Must Have (supports BR-015 stamp duty configurability, custom broker support)**
+
+**Developer Action Plan**
+
+```gherkin
+Given the stamp duty rate is gazetted to change before 12 July 2028
+When an operator PATCHes /admin/config/fees with the ADMIN_API_KEY header
+Then the system_config value updates immediately, invalidating the in-process TTLCache,
+     and all subsequent fee calculations use the new rate without a code deployment
+```
+
+**Acceptance Criteria**
+
+- [ ] `/admin/config/fees` protected by a distinct `ADMIN_API_KEY` (not the user JWT scheme), compared in constant time
+- [ ] `GET`/`PATCH /admin/config/fees` documents its TTLCache staleness explicitly (60-minute TTL, per-process on a single V1 instance) — per API security review finding OQ-000
+- [ ] `GET /api/v1/brokers` lists system brokers (`is_system=true`) plus the caller's own custom configs; `POST/PATCH/DELETE /api/v1/brokers/{id}` scoped to the user's own custom configs only
+- [ ] Custom broker validation per VR-014: name required/≤60 chars/unique vs. system names; percentage rate 0–2%; minimum fee RM0–100; flat fee RM0.01–100
+- [ ] Deleting a custom `BrokerConfig` referenced by any `Lot` returns 409 `{"error": "in_use", "message": "This broker config is used by existing lots and cannot be deleted."}`
+- [ ] System brokers (`is_system=true`) can never be modified or deleted via the API
+- [ ] `audit_log` entry `CONFIG_UPDATED` on every fee-config change
+
+**Definition of Done**
+
+- [ ] Test confirms a `system_config` change (e.g., stamp duty rate) is reflected in a subsequent `BE-2.1` fee calculation without a redeploy, once the TTLCache expires or is invalidated
+- [ ] Admin endpoint rate limit confirmed intentional (60/min keyed by API key — carried forward from API design Stage 2, per the API security review's open item #3)
+
+**Dependencies & Integrations**
+
+- `system_config` and `BrokerConfig` tables (Epic 9 seed data)
+
+**Technical Constraints**
+
+- `BrokerConfig.rate`/`minimum_fee` are fixed at config time; clearing fee % and stamp duty rate are always read from `system_config` at calculation time, not duplicated into `BrokerConfig` (architecture §10.6) — this ensures a stamp duty rate change applies uniformly across all brokers instantly
+
+---
+
+## FE-8.1 — Account Settings: Data Export & Delete Account UI
+
+**FR-018, FR-019 · Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user is in Account Settings
+When they click "Delete My Account"
+Then they are offered a data export first, then must type "DELETE" to confirm, and
+     receive on-screen confirmation that they've been logged out and cannot log back
+     in during the 30-day window
+```
+
+**Acceptance Criteria**
+
+- [ ] "Download My Data" button triggers the BE-8.1 export directly from Account Settings, independent of the deletion flow
+- [ ] Deletion flow matches BAS Workflow 9's two-step confirmation exactly, including the literal "DELETE" typed-confirmation requirement
+- [ ] Cancellation-email link, when clicked (outside the app, from the user's inbox), lands on a confirmation page showing the account was restored
+
+**Definition of Done**
+
+- [ ] Full deletion request → cancel-within-window UI flow manually tested end to end
+
+**Dependencies & Integrations**
+
+- BE-8.1, BE-8.2
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+## FE-8.2 — Custom Broker Config UI
+
+**Priority: Must Have (supports FR-003/FR-004 for users on brokers outside the system list)**
+
+**Developer Action Plan**
+
+```gherkin
+Given a user's broker isn't in the system-provided list
+When they create a custom broker with a percentage or flat fee structure
+Then it appears in their broker dropdown for future lots, and cannot be deleted once
+     referenced by an existing lot
+```
+
+**Acceptance Criteria**
+
+- [ ] Form validation matches VR-014 exactly (rate bounds, minimum/flat fee bounds, name uniqueness)
+- [ ] Attempting to delete an in-use custom broker surfaces the 409 `in_use` message clearly, with guidance to reassign or delete the referencing lots first
+
+**Definition of Done**
+
+- [ ] Verified against BE-8.3's validation and conflict-handling behavior
+
+**Dependencies & Integrations**
+
+- BE-8.3
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+# Epic 9 — Deployment & Infrastructure
+
+## DEP-9.1 — Repository Scaffold & Local Dev Environment
+
+**Priority: Must Have (foundational — blocks all other epics)**
+
+**Developer Action Plan**
+
+```gherkin
+Given the repository currently contains only /specs
+When a developer clones the repo and runs the local dev setup
+Then docker-compose brings up FastAPI, Next.js, and PostgreSQL locally, matching the
+     module structure defined in Solution-Architecture §7.2
+```
+
+**Acceptance Criteria**
+
+- [ ] Backend scaffold matches the exact module layout: `app/{auth,portfolio,pricing,subscription,admin}/{models,schemas,router,service}.py`, plus `app/scripts/` for cron jobs
+- [ ] Frontend scaffold matches the Next.js App Router layout: `(auth)` and `(app)` route groups, `components/{ui,portfolio,dividends,calculator,subscription,shared}`, `hooks/`, `lib/`
+- [ ] `docker-compose.yml` runs FastAPI + Next.js + PostgreSQL with hot-reload for local development
+- [ ] `.env.example` documents every required environment variable from architecture §14.5 without committing real secrets
+- [ ] No cross-module direct database joins — all cross-domain access goes through service-layer interfaces (P-008), enforced by code review / import-linting from day one
+
+**Definition of Done**
+
+- [ ] A fresh clone + `docker-compose up` reaches a working "hello world" health check on both frontend and backend with zero manual steps beyond copying `.env.example`
+
+**Dependencies & Integrations**
+
+- None — this is the first story in sequence
+
+**Technical Constraints**
+
+- Python 3.13, FastAPI, async SQLAlchemy, Pydantic v2; Next.js 15, TypeScript strict mode, Tailwind, shadcn/ui (architecture §1 "at a glance" table)
+
+---
+
+## DEP-9.2 — CI Pipeline (GitHub Actions)
+
+**Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given a developer opens a pull request
+When GitHub Actions CI runs
+Then pytest (backend), tsc --noEmit (frontend types), and eslint (frontend lint) all
+     execute, and a failure in any step blocks merge and blocks deployment
+```
+
+**Acceptance Criteria**
+
+- [ ] CI workflow file at `.github/workflows/ci.yml` runs all three checks on every PR
+- [ ] Merge to `main` is gated on CI passing (architecture §18.2 flowchart)
+- [ ] CI failure produces a clear, actionable log — not just a red X
+
+**Definition of Done**
+
+- [ ] A deliberately broken test/type-error/lint violation in a test PR is confirmed to block the pipeline
+
+**Dependencies & Integrations**
+
+- DEP-9.1 scaffold must exist first
+
+**Technical Constraints**
+
+- None additional
+
+---
+
+## DEP-9.3 — Hosting Setup (Vercel + Render)
+
+**Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given CI passes on a merge to main
+When the deployment pipeline runs
+Then Vercel auto-deploys the Next.js frontend to production, Render runs
+     "alembic upgrade head" as a pre-deploy command, and — only if migrations succeed —
+     deploys the new FastAPI version; PR branches get automatic Vercel preview URLs
+```
+
+**Acceptance Criteria**
+
+- [ ] Render web service, four cron job schedules (`refresh_prices.py`, `check_trial_expiry.py`, `process_deletions.py`), and managed PostgreSQL are all provisioned (note: architecture §8.4 documents that a previously-planned `process_renewals.py` cron was removed — renewal is Stripe-native, see BE-7.1; do not provision this fourth cron job)
+- [ ] A failed `alembic upgrade head` aborts the deploy and leaves the previous FastAPI version running (architecture §18.2)
+- [ ] Render starter plan (not free tier) is used to avoid cold starts (R-008 mitigation)
+- [ ] CORS configured with the programmatic origin validator from architecture §14.3 — **not** a `"https://*.vercel.app"` wildcard (CRIT-R-001 — this was an explicitly corrected security defect; do not reintroduce the wildcard pattern)
+- [ ] Rollback procedure documented and tested at least once: Vercel "redeploy previous," Render "redeploy previous deploy," `alembic downgrade -1` if needed (architecture §18.4)
+- [ ] ⚠ Known risk accepted for V1 (HIGH-R-003): Vercel preview deployments point at the **production** Render API. All preview testing must use a dedicated non-real test account; never exercise delete/import/PDPA flows against real data from a preview URL. A staging Render service (~USD 7/month) is the recommended medium-term fix — provision before the first paid user, not required to block V1 launch
+
+**Definition of Done**
+
+- [ ] End-to-end deploy verified: a merged PR reaches production on both Vercel and Render within the expected pipeline time, with migrations applied correctly
+
+**Dependencies & Integrations**
+
+- DEP-9.1, DEP-9.2
+
+**Technical Constraints**
+
+- All secrets (DATABASE_URL, JWT_PRIVATE_KEY, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, RESEND_API_KEY, SENTRY_DSN, ADMIN_API_KEY) set as Render/Vercel environment variables only — never committed to git (architecture §14.5)
+- Stripe test-mode keys in every non-production environment (MED-R-001)
+
+---
+
+## DEP-9.4 — Database Migration Baseline & Seed Data
+
+**Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given the physical schema is fully specified in the Database Design artifacts
+When the first Alembic migration is authored and applied
+Then all core tables exist (users, portfolios, positions, lots, dividend_tranches,
+     price_snapshots, broker_configs, stocks, system_config, audit_log, import_jobs,
+     pending_tokens, pending_email_notifications, processed_webhook_events,
+     subscription_records), with system brokers, an initial Bursa stock reference list,
+     and stamp-duty/clearing-fee system_config values seeded
+```
+
+**Acceptance Criteria**
+
+- [ ] Every migration is additive-only (new tables/columns); destructive changes (drops/renames) are deferred to a separate subsequent deployment (ADR-011, P-007) — this makes every deploy safely rollback-able
+- [ ] Seed data includes the V1 system broker list (Maybank IB, CIMB Clicks, RHB Reflex, Rakuten Trade, Mirae Asset, M+ Online) with `is_system=true`
+- [ ] `system_config` seeded with `stamp_duty_rate`, `price_deviation_max_pct` (default 75), `bursa_holidays` (current year's calendar)
+- [ ] All monetary columns use `NUMERIC` with the precisions specified in architecture §12.3 — never `FLOAT`/`DOUBLE`
+- [ ] Required indexes created per architecture §8.3: `lots(position_id, is_deleted)`, `dividend_tranches(position_id, year, is_deleted)`, `price_snapshots(stock_code, trading_date)`, `audit_log(user_id)`, `audit_log(entity_type, entity_id)`, `import_jobs(user_id, status)`, `processed_webhook_events(event_id)` (PK)
+- [ ] `Lot` and `DividendTranche` include a `version INTEGER` column for optimistic locking from the first migration, not retrofitted later
+- [ ] `users.audit_log` FK relationship is `ON DELETE CASCADE` (HIGH-R-007 — required for BE-8.2's hard-delete correctness)
+
+**Definition of Done**
+
+- [ ] `alembic upgrade head` and `alembic downgrade -1` both verified to work cleanly against a fresh database
+- [ ] Schema reviewed against `BursaTrack-DB-Stage3-Physical-Schema.md` for exact field/type/constraint parity
+
+**Dependencies & Integrations**
+
+- Blocks Epics 1–8 (nothing can be built without the schema existing)
+
+**Technical Constraints**
+
+- PostgreSQL 16, Alembic-managed migrations only — no manual schema changes in any environment
+
+---
+
+## DEP-9.5 — Observability Setup
+
+**Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given the application is deployed
+When any request is served or any cron job runs
+Then structlog emits structured JSON logs to stdout, Sentry captures unhandled
+     exceptions with request context (excluding financial data and request bodies),
+     each cron script reports a Sentry Cron Monitoring check-in, and BetterUptime
+     polls /health every 3 minutes
+```
+
+**Acceptance Criteria**
+
+- [ ] `GET /health` checks DB connectivity (`SELECT 1`) and returns 503 on failure — this is the sole uptime-monitoring signal (architecture §17.3)
+- [ ] Sentry integrated in three contexts: FastAPI (via SDK middleware), Next.js (`@sentry/nextjs`), and each of the three cron scripts (try/except wrapping with `capture_exception` + `capture_check_in`)
+- [ ] Sensitive-data exclusion verified: no request body, portfolio value, or dividend amount ever appears in a log line or Sentry payload
+- [ ] Alerting matrix from architecture §17.5 wired up: new Sentry error type → email; missed cron check-in → email; >50% price refresh failure → email (+Slack if configured); `/health` unreachable → email+SMS via BetterUptime
+
+**Definition of Done**
+
+- [ ] A deliberately-triggered exception in a test/staging path is confirmed to appear in Sentry with the expected (sanitized) context
+- [ ] A deliberately-skipped cron run is confirmed to trigger a Sentry Cron Monitoring alert
+
+**Dependencies & Integrations**
+
+- DEP-9.3 (hosting), all cron jobs (Epics 5, 7, 8)
+
+**Technical Constraints**
+
+- No custom APM/metrics beyond Render's built-in dashboard at V1 (explicitly deferred to V2 per architecture §20.2)
+
+---
+
+## DEP-9.6 — Security Hardening Baseline
+
+**Priority: Must Have**
+
+**Developer Action Plan**
+
+```gherkin
+Given the API is publicly reachable
+When any request arrives
+Then CORS, rate limiting, HTTPS/HSTS, and secrets handling all conform to the
+     architecture's security baseline before the first real user account is created
+```
+
+**Acceptance Criteria**
+
+- [ ] CORS uses the programmatic origin validator (static allowlist + Vercel-preview regex), never a broad wildcard, with `allow_credentials=True` (CRIT-R-001, architecture §14.3)
+- [ ] SlowAPI rate limits applied exactly per architecture §14.4's table (register 3/min, login 5/min, password-reset-request 3/min, CSV import 2/min per user, Stripe webhook 100/min per IP, all other authenticated endpoints 60/min per user)
+- [ ] HTTPS enforced on all endpoints; HTTP redirects to HTTPS at the platform level; HSTS headers set (architecture §14.6)
+- [ ] `ADMIN_API_KEY` compared in constant time, distinct from the JWT/user auth scheme
+- [ ] Every ownership-checked resource returns 404 (never 403) on cross-user access attempts — verified as a cross-cutting test across all Epic 2–8 endpoints, not just spot-checked on one
+- [ ] Login response body has a `maxLength: 128` bound on the password field (defensive bound per API security review finding IV-000) even though it's unlikely exploitable
+- [ ] `info.description` / equivalent internal documentation explicitly states HTTPS-only enforcement, per API security review finding SC-000
+
+**Definition of Done**
+
+- [ ] Security test cases from BAS §14 (accessing another user's data → 404, rate-limit lockout behavior, cookie flags, session expiry, reset-token reuse) automated and passing
+- [ ] Security-review action items from `04-api-security-review.md` §4 ("Prioritised Change List") confirmed complete: the four ✅-marked items already applied, plus the four remaining LOW-priority items (422 on login, staleness note on `/admin/config/fees`, HTTPS/HSTS description sentence, `maxLength` on login password) closed out before launch
+
+**Dependencies & Integrations**
+
+- Cuts across every epic's endpoints — this story's tests should be written as a suite that runs against the whole API surface, not a single module
+
+**Technical Constraints**
+
+- No secrets in git, ever, at any point in history — verify with a pre-commit secret scanner if not already in place
+
+---
+
+## Summary — Traceability Checklist
+
+Every Must-Have and Should-Have FR from the BAS is covered by at least one Backend and one Frontend story above:
+
+| FR                           | Backend Story  | Frontend Story                   |
+| ---------------------------- | -------------- | -------------------------------- |
+| FR-001 Registration          | BE-1.1         | FE-1.1                           |
+| FR-002 Login/Logout          | BE-1.2         | FE-1.2                           |
+| FR-003 Add Position          | BE-2.1         | FE-2.1                           |
+| FR-004 Add Lot               | BE-2.2         | FE-2.2                           |
+| FR-005 Edit Position/Lot     | BE-2.3         | FE-2.3                           |
+| FR-006 Delete Position       | BE-2.4         | FE-2.4                           |
+| FR-007 Auto Price Refresh    | BE-5.1         | (dashboard reflects it — FE-4.1) |
+| FR-008 Price Outage Handling | BE-5.2         | FE-5.1                           |
+| FR-009 Log Dividend Tranche  | BE-3.1 (P0)    | FE-3.1                           |
+| FR-010 Edit/Delete Dividend  | BE-3.2         | FE-3.2                           |
+| FR-011 Portfolio Dashboard   | BE-4.1         | FE-4.1                           |
+| FR-012 Sell Calculator       | BE-4.2         | FE-4.2                           |
+| FR-013 Dividend Calendar     | BE-3.3         | FE-3.3                           |
+| FR-014 CSV Import            | BE-6.1         | FE-6.1                           |
+| FR-015 CSV Template          | BE-6.2         | FE-6.2                           |
+| FR-016 Subscription          | BE-7.1, BE-7.2 | FE-7.1, FE-7.2                   |
+| FR-017 Password Reset        | BE-1.3         | FE-1.3                           |
+| FR-018 PDPA Export           | BE-8.1         | FE-8.1                           |
+| FR-019 Account Deletion      | BE-8.2         | FE-8.1                           |
+
+**Outstanding stakeholder sign-offs that do not block starting work, but must close before launch** (carried from BAS §13 Open Questions): OQ-001 (trial length), OQ-002 (SST on brokerage — critical, verify immediately), OQ-005 (sell-calculator default broker), OQ-007 (password reset Must-Have confirmation), OQ-008/OQ-009 (PDPA legal sign-off — critical), OQ-010 (refund policy), OQ-012 (CSV import conflict resolution).
