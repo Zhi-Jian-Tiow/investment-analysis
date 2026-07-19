@@ -1505,6 +1505,8 @@ CREATE TABLE audit_log (
 | Lot created                        | `LOT_CREATED`            |
 | Lot updated                        | `LOT_UPDATED`            |
 | Lot deleted                        | `LOT_DELETED`            |
+| Position updated                   | `POSITION_UPDATED`       |
+| Position deleted (cascades to soft-deleting its lots/tranches) | `POSITION_DELETED` |
 | DividendTranche created            | `DIVIDEND_CREATED`       |
 | DividendTranche updated            | `DIVIDEND_UPDATED`       |
 | DividendTranche deleted            | `DIVIDEND_DELETED`       |
@@ -1517,6 +1519,13 @@ CREATE TABLE audit_log (
 | Account hard-deleted               | `ACCOUNT_DELETED`        |
 | SystemConfig fee parameter updated | `CONFIG_UPDATED`         |
 | PDPA data export downloaded        | `DATA_EXPORT_DOWNLOADED` |
+
+> `POSITION_UPDATED` / `POSITION_DELETED` were added after the initial architecture pass to
+> reconcile a gap identified during API design (Stage 4 review, finding OQ-001): BAS
+> Enhanced Part 2 §7 explicitly requires auditing Position CREATE, DELETE, and UPDATE of
+> `category_tag`/`stock_name`, but this table originally had no corresponding action value
+> for Position update or delete (Position create was already covered indirectly via
+> `LOT_CREATED`, since the first Lot on a Position creates it).
 
 ---
 
