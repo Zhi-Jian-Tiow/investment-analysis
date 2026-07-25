@@ -37,6 +37,16 @@ class Settings(BaseSettings):
     # guess, so it's a one-line config change once the frontend is deployed.
     frontend_base_url: str = "http://localhost:3000"
 
+    # CORS (architecture §14.3). Comma-separated static allowlist. The
+    # architecture's fuller design (production domain + a regex for Vercel
+    # preview URLs) is deferred until there's an actual deployment target —
+    # this is just enough for local dev against the FE-1.x Next.js app.
+    cors_allowed_origins: str = "http://localhost:3000"
+
+    @property
+    def cors_allowed_origins_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
+
 
 @lru_cache
 def get_settings() -> Settings:

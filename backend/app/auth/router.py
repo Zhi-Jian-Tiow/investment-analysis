@@ -27,6 +27,7 @@ from app.auth.service import (
     logout_user,
     register_user,
     request_password_reset,
+    resend_verification_email,
     reset_password,
     verify_email,
 )
@@ -81,6 +82,21 @@ async def verify_register_email(
 ) -> UserResponse:
     user = await verify_email(db, token)
     return UserResponse.model_validate(user)
+
+
+@router.post("/resend-verification", response_model=MessageResponse)
+@limiter.limit("3/minute")
+async def resend_verification(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    raw_token = await resend_verification_email(db, user=current_user, settings=settings)
+    if raw_token is not None:
+        background_tasks.add_task(send_verification_email, current_user.email, raw_token, settings)
+    return MessageResponse(message="Verification email sent. Please check your inbox.")
 
 
 @router.post("/login", response_model=AuthResponse)

@@ -50,3 +50,36 @@ async def get_current_user(
         raise unauthorized("token_revoked", "This session has been revoked. Please log in again.")
 
     return user
+
+
+async def get_current_user_optional(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> User | None:
+    """Same validation as get_current_user, but returns None instead of
+    raising when there's no session (or an invalid one) rather than 401ing.
+
+    Needed for GET /api/v1/brokers (FE-1.1): the OpenAPI spec documents that
+    endpoint as requiring auth (it also returns the caller's own custom
+    brokers), but the registration page — which needs the system broker list
+    to populate its dropdown — runs before any session exists. This lets the
+    one endpoint serve both cases: system brokers always, plus the caller's
+    custom brokers when they happen to be logged in.
+    """
+    token = request.cookies.get(settings.session_cookie_name)
+    if not token:
+        return None
+
+    try:
+        payload = jwt.decode(token, settings.jwt_public_key, algorithms=["RS256"])
+        user_id = uuid.UUID(payload.get("user_id", ""))
+    except (jwt.PyJWTError, ValueError, AttributeError, TypeError):
+        return None
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if user is None or user.token_version != payload.get("token_version"):
+        return None
+
+    return user

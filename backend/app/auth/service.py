@@ -241,6 +241,41 @@ async def authenticate_user(
     return user, access_token, expires_at
 
 
+async def resend_verification_email(db: AsyncSession, *, user: User, settings: Settings) -> str | None:
+    """FE-1.1 AC: "'Resend verification email' control visible on the banner".
+
+    Returns the new raw token (for the caller to email), or None if the
+    account is already verified — a no-op rather than an error, since
+    re-sending a verification email to an already-verified account has no
+    purpose and would just be noise.
+
+    Reuses the exact HIGH-R-011 delete-before-insert pattern BE-1.3 already
+    established for password_reset tokens, applied to email_verification
+    tokens instead: the pending_tokens_user_type_unique constraint requires
+    it (only one row per (user_id, type) can exist), and only the
+    most-recently-sent link should ever be valid.
+    """
+    if user.email_verified:
+        return None
+
+    raw_token = generate_raw_token()
+    await db.execute(
+        delete(PendingToken).where(PendingToken.user_id == user.id, PendingToken.type == EMAIL_VERIFICATION_TYPE)
+    )
+    db.add(
+        PendingToken(
+            user_id=user.id,
+            type=EMAIL_VERIFICATION_TYPE,
+            token_hash=hash_token(raw_token),
+            expires_at=datetime.now(timezone.utc)
+            + timedelta(hours=settings.email_verification_token_expiry_hours),
+        )
+    )
+    await db.commit()
+
+    return raw_token
+
+
 async def logout_user(db: AsyncSession, user: User) -> None:
     """FR-002: incrementing token_version invalidates every outstanding JWT
     for this user (not just the calling session's cookie), since the JWT

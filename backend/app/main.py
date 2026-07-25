@@ -1,5 +1,6 @@
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -7,8 +8,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.router import router as auth_router
+from app.config import get_settings
 from app.database import get_db
 from app.errors import AppError
+from app.portfolio.router import router as portfolio_router
 from app.rate_limit import limiter
 
 
@@ -17,6 +20,19 @@ def create_app() -> FastAPI:
 
     app.state.limiter = limiter
     app.add_middleware(SlowAPIMiddleware)
+
+    # allow_credentials=True is required for the HTTP-only session cookie to
+    # be sent cross-origin (frontend on :3000, backend on :8000 in dev) — see
+    # architecture §14.3. That flag makes a wildcard allow_origins invalid
+    # per the CORS spec, so this must be a concrete origin list.
+    settings = get_settings()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_allowed_origins_list,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+        allow_headers=["Content-Type"],
+    )
 
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
@@ -56,6 +72,7 @@ def create_app() -> FastAPI:
         return response
 
     app.include_router(auth_router)
+    app.include_router(portfolio_router)
 
     @app.get("/health")
     async def health_check(db: AsyncSession = Depends(get_db)):
