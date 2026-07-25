@@ -4,16 +4,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.database import get_db
-from app.email import send_verification_email
+from app.email import send_password_reset_email, send_verification_email
 from app.rate_limit import limiter
 
 from app.auth.dependencies import get_current_user
 from app.auth.lockout import tracker as login_lockout_tracker
 from app.auth.models import User
-from app.auth.schemas import AuthResponse, JwksResponse, LoginRequest, RegisterRequest, UserResponse
+from app.auth.schemas import (
+    AuthResponse,
+    JwksResponse,
+    LoginRequest,
+    MessageResponse,
+    PasswordResetComplete,
+    PasswordResetRequest,
+    RegisterRequest,
+    UserResponse,
+)
 from app.auth.security import build_jwks
-from app.auth.service import authenticate_user, issue_access_token, logout_user, register_user, verify_email
+from app.auth.service import (
+    authenticate_user,
+    issue_access_token,
+    logout_user,
+    register_user,
+    request_password_reset,
+    reset_password,
+    verify_email,
+)
 from app.errors import AppError, account_locked
+
+GENERIC_PASSWORD_RESET_MESSAGE = "If an account with that email exists, a reset link has been sent."
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -47,7 +66,7 @@ async def register(
         settings=settings,
     )
 
-    background_tasks.add_task(send_verification_email, user.email, raw_token)
+    background_tasks.add_task(send_verification_email, user.email, raw_token, settings)
     _set_session_cookie(response, settings, access_token)
 
     return AuthResponse(user=UserResponse.model_validate(user), expires_at=expires_at)
@@ -126,3 +145,33 @@ async def refresh(
 @router.get("/jwks.json", response_model=JwksResponse)
 async def jwks(settings: Settings = Depends(get_settings)) -> JwksResponse:
     return JwksResponse.model_validate(build_jwks(settings.jwt_public_key))
+
+
+@router.post("/password-reset-request", response_model=MessageResponse)
+@limiter.limit("3/minute")
+async def password_reset_request(
+    request: Request,
+    payload: PasswordResetRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> MessageResponse:
+    user, raw_token = await request_password_reset(db, email=payload.email)
+
+    # Only queue the email when an account actually exists. The HTTP response
+    # itself never varies (account enumeration protection, BAS Workflow 8).
+    if user is not None:
+        background_tasks.add_task(send_password_reset_email, user.email, raw_token, settings)
+
+    return MessageResponse(message=GENERIC_PASSWORD_RESET_MESSAGE)
+
+
+@router.post("/password-reset", response_model=MessageResponse)
+@limiter.limit("10/minute")
+async def password_reset(
+    request: Request,
+    payload: PasswordResetComplete,
+    db: AsyncSession = Depends(get_db),
+) -> MessageResponse:
+    await reset_password(db, raw_token=payload.token, new_password=payload.new_password)
+    return MessageResponse(message="Password updated successfully. Please log in.")

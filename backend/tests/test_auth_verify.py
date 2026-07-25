@@ -10,7 +10,7 @@ from app.auth.security import hash_token
 async def _register_and_capture_token(client, monkeypatch, email: str, broker_id: str) -> str:
     captured: dict[str, str] = {}
 
-    async def fake_send(to_email: str, raw_token: str) -> None:
+    async def fake_send(to_email: str, raw_token: str, settings=None) -> None:
         captured["token"] = raw_token
 
     # send_verification_email is imported into app.auth.router and called via

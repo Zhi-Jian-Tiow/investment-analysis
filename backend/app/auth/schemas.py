@@ -4,6 +4,18 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
+def _check_password_complexity(value: str) -> str:
+    # VR-002: at least one uppercase letter, at least one digit. Shared by
+    # every schema that accepts a NEW password (RegisterRequest,
+    # PasswordResetComplete) — LoginRequest deliberately does not use this,
+    # see its docstring.
+    if not any(char.isupper() for char in value):
+        raise ValueError("Password must contain at least one uppercase letter")
+    if not any(char.isdigit() for char in value):
+        raise ValueError("Password must contain at least one digit")
+    return value
+
+
 class RegisterRequest(BaseModel):
     """Matches components/schemas/RegisterRequest in 03-openapi-specification.md
     exactly: email, password, broker_id. (password_confirm is a frontend-only
@@ -17,12 +29,7 @@ class RegisterRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def validate_password_complexity(cls, value: str) -> str:
-        # VR-002: at least one uppercase letter, at least one digit.
-        if not any(char.isupper() for char in value):
-            raise ValueError("Password must contain at least one uppercase letter")
-        if not any(char.isdigit() for char in value):
-            raise ValueError("Password must contain at least one digit")
-        return value
+        return _check_password_complexity(value)
 
 
 class LoginRequest(BaseModel):
@@ -35,6 +42,34 @@ class LoginRequest(BaseModel):
 
     email: EmailStr
     password: str = Field(..., max_length=128)
+
+
+class PasswordResetRequest(BaseModel):
+    """Matches components/schemas/PasswordResetRequest in
+    03-openapi-specification.md. No uniqueness/existence check happens at the
+    schema layer — the service layer deliberately treats "found" and
+    "not found" identically (account enumeration protection).
+    """
+
+    email: EmailStr
+
+
+class PasswordResetComplete(BaseModel):
+    """Matches components/schemas/PasswordResetComplete. `token` travels in
+    the request body, never the URL (BAS Workflow 8 / API security review).
+    """
+
+    token: str
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_password_complexity(cls, value: str) -> str:
+        return _check_password_complexity(value)
+
+
+class MessageResponse(BaseModel):
+    message: str
 
 
 class JwkKey(BaseModel):

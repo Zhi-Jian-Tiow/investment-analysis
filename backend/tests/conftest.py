@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 import pytest_asyncio
+import resend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport, AsyncClient
@@ -51,6 +52,26 @@ async def reset_login_lockout():
     # Same reasoning as reset_rate_limiter, for the separate BR-016 in-process
     # login-failure tracker.
     login_lockout_tracker.reset()
+    yield
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def block_real_resend_calls(monkeypatch):
+    """Safety net, not the primary test strategy: most auth tests monkeypatch
+    app.auth.router.send_verification_email/send_password_reset_email
+    directly, but a few (e.g. test_auth_register.py) don't bother, since they
+    aren't testing email behaviour. Without this, those tests would trigger
+    the REAL app.email code path via BackgroundTasks — with an empty
+    test-config resend_api_key — making a real, slow, unpredictable network
+    call on every test run. This forces every such call to fail fast and
+    in-process instead; app.email's own try/except already guarantees that
+    failure doesn't propagate to the caller.
+    """
+
+    def _blocked_send(*args, **kwargs):
+        raise RuntimeError("Real Resend network calls are not allowed in tests — mock app.email instead.")
+
+    monkeypatch.setattr(resend.Emails, "send", _blocked_send)
     yield
 
 

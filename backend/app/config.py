@@ -27,6 +27,16 @@ class Settings(BaseSettings):
 
     admin_api_key: str = ""
 
+    # Resend (architecture §11.3). email_from_address defaults to Resend's own
+    # sandbox sender, which works with no domain verification — fine for local
+    # dev/testing; swap to a verified BursaTrack domain address before launch.
+    resend_api_key: str = ""
+    email_from_address: str = "BursaTrack <onboarding@resend.dev>"
+    # Base URL emailed verify/reset links point at. No frontend exists yet
+    # (FE-1.x not started) — this makes that an env var, not a hardcoded
+    # guess, so it's a one-line config change once the frontend is deployed.
+    frontend_base_url: str = "http://localhost:3000"
+
 
 @lru_cache
 def get_settings() -> Settings:

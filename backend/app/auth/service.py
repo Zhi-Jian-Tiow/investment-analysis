@@ -1,14 +1,13 @@
 """BE-1.1: User Registration & Email Verification (FR-001).
 BE-1.2: Login, Logout, Session Refresh & Rate Limiting (FR-002).
-
-Password reset (BE-1.3) is a separate story and is not implemented here yet.
+BE-1.3: Password Reset Flow (FR-017).
 """
 
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.service import record_audit_event
@@ -26,6 +25,11 @@ from app.auth.security import (
 from app.auth.models import PendingToken, User
 
 EMAIL_VERIFICATION_TYPE = "email_verification"
+PASSWORD_RESET_TYPE = "password_reset"
+# BAS FR-017 / Workflow 8: 1-hour expiry — deliberately shorter than
+# email-verification's 24 hours (settings.email_verification_token_expiry_hours),
+# since a reset link is more sensitive if intercepted.
+PASSWORD_RESET_TOKEN_EXPIRY_HOURS = 1
 
 
 async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
@@ -152,20 +156,34 @@ async def register_user(
     return user, raw_token, access_token, expires_at
 
 
-async def verify_email(db: AsyncSession, raw_token: str) -> User:
+async def _consume_pending_token(
+    db: AsyncSession,
+    *,
+    raw_token: str,
+    token_type: str,
+    invalid_message: str,
+    used_message: str,
+    expired_message: str,
+) -> PendingToken:
+    """Shared not-found/already-used/expired validation for any pending_tokens
+    row (email verification, password reset, and — later — deletion
+    cancellation in Epic 8 all follow this identical shape). Marks the row
+    used_at on success; callers still own their own db.commit().
+    """
     token_hash = hash_token(raw_token)
     result = await db.execute(
         select(PendingToken).where(
             PendingToken.token_hash == token_hash,
-            PendingToken.type == EMAIL_VERIFICATION_TYPE,
+            PendingToken.type == token_type,
         )
     )
     token_row = result.scalar_one_or_none()
 
     if token_row is None:
-        raise invalid_token("This verification link is invalid.")
+        raise invalid_token(invalid_message)
     if token_row.used_at is not None:
-        raise invalid_token("This verification link has already been used.")
+        raise invalid_token(used_message)
+
     expires_at = token_row.expires_at
     if expires_at.tzinfo is None:
         # SQLite (used in tests) round-trips DateTime(timezone=True) as naive;
@@ -173,9 +191,21 @@ async def verify_email(db: AsyncSession, raw_token: str) -> User:
         # is correct on both backends.
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if expires_at < datetime.now(timezone.utc):
-        raise invalid_token("This verification link has expired. Request a new one?")
+        raise invalid_token(expired_message)
 
     token_row.used_at = datetime.now(timezone.utc)
+    return token_row
+
+
+async def verify_email(db: AsyncSession, raw_token: str) -> User:
+    token_row = await _consume_pending_token(
+        db,
+        raw_token=raw_token,
+        token_type=EMAIL_VERIFICATION_TYPE,
+        invalid_message="This verification link is invalid.",
+        used_message="This verification link has already been used.",
+        expired_message="This verification link has expired. Request a new one?",
+    )
 
     user_result = await db.execute(select(User).where(User.id == token_row.user_id))
     user = user_result.scalar_one()
@@ -219,3 +249,74 @@ async def logout_user(db: AsyncSession, user: User) -> None:
     """
     user.token_version += 1
     await db.commit()
+
+
+async def request_password_reset(db: AsyncSession, *, email: str) -> tuple[User | None, str | None]:
+    """FR-017 / BAS Workflow 8. Never raises — the router must return an
+    identical response regardless of the outcome (account enumeration
+    protection). Returns (None, None) when no account matches; the caller
+    uses that only to decide whether to queue a reset email, never to vary
+    the HTTP response.
+
+    Timing note: this function always performs the get_user_by_email lookup
+    (the dominant cost) on both branches. Only the found branch additionally
+    performs two small local writes (delete old token, insert new token).
+    That residual difference is not padded to be cryptographically constant
+    time — consistent with architecture §14.1's own risk acceptance that
+    ordinary network jitter dominates at V1 scale — see BE-1.3's
+    Implementation Record for the explicit trade-off.
+    """
+    user = await get_user_by_email(db, email)
+    if user is None:
+        return None, None
+
+    raw_token = generate_raw_token()
+
+    # HIGH-R-011 / pending_tokens_user_type_unique: delete any previous
+    # password_reset token for this user before inserting the new one — the
+    # DB's UNIQUE(user_id, type) constraint would reject a second insert
+    # otherwise, and only the most-recently-requested reset link should ever
+    # be valid.
+    await db.execute(
+        delete(PendingToken).where(PendingToken.user_id == user.id, PendingToken.type == PASSWORD_RESET_TYPE)
+    )
+    db.add(
+        PendingToken(
+            user_id=user.id,
+            type=PASSWORD_RESET_TYPE,
+            token_hash=hash_token(raw_token),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=PASSWORD_RESET_TOKEN_EXPIRY_HOURS),
+        )
+    )
+    await db.commit()
+
+    return user, raw_token
+
+
+async def reset_password(db: AsyncSession, *, raw_token: str, new_password: str) -> User:
+    token_row = await _consume_pending_token(
+        db,
+        raw_token=raw_token,
+        token_type=PASSWORD_RESET_TYPE,
+        invalid_message="This reset link is invalid.",
+        used_message="This reset link has already been used. If you did not reset your password, contact support.",
+        expired_message="This reset link has expired. Request a new one?",
+    )
+
+    user_result = await db.execute(select(User).where(User.id == token_row.user_id))
+    user = user_result.scalar_one()
+
+    user.password_hash = await _hash_password_async(new_password)
+    # BR-019/EX-011: invalidates every active session for this user, on every
+    # device, immediately — the same mechanism logout uses.
+    user.token_version += 1
+    if not user.email_verified:
+        # EC-017: clicking a reset link proves control of the inbox, same as
+        # clicking a verification link would have.
+        user.email_verified = True
+
+    await record_audit_event(db, user_id=user.id, action="PASSWORD_CHANGED", entity_type="User", entity_id=user.id)
+
+    await db.commit()
+    await db.refresh(user)
+    return user

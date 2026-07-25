@@ -66,7 +66,7 @@ Then a User row is created with account_status="trial", trial_expiry_date = toda
 **Dependencies & Integrations**
 
 - `BrokerConfig` seed data must exist first — delivered via Alembic migration `0004_seed_system_brokers`, not full Epic 9
-- ~~Resend API key configured~~ — **not done**; email sending is a logging stub, see Deviation 5
+- Resend API key configured — ✅ resolved 2026-07-25, see Deviation 5's update
 - `pending_tokens` table (architecture §14.1) — delivered via migration `0001`
 
 **Technical Constraints**
@@ -95,7 +95,7 @@ Then a User row is created with account_status="trial", trial_expiry_date = toda
 2. **Request shape.** Implemented to match `03-openapi-specification.md`'s `RegisterRequest` exactly: `email`, `password`, `broker_id` only. There is no server-side `password_confirm` field (that's a client-only UX concern, owned by FE-1.1) and no `default_broker_id` field name (the OpenAPI contract calls it `broker_id`). This story's own AC text (written before the OpenAPI spec was cross-checked) still refers to the old names.
 3. **Duplicate-email error shape.** Returns `422 validation_failed` with `fields: [{"field": "email", "constraint": "already registered", ...}]`, not a `409`, and not the BAS's suggested copy ("An account with this email already exists. Log in instead?"). This matches `03-openapi-specification.md`, which documents only `201`/`422`/`429` for `/auth/register` — no `409` is in the contract.
 4. **Broker validation (VR-007).** Implemented as "must reference an existing `BrokerConfig`" only. The physical schema (`BursaTrack-DB-Stage3-Physical-Schema.md` §3.4, authoritative and downstream of the BAS) has no `is_active` column on `broker_configs` — the "active broker" concept from VR-007/BAS Entity 8 was dropped somewhere between the BA and DB design stages and was never carried into the table that actually exists.
-5. **Email delivery is not wired up.** `app/email.py::send_verification_email` logs the intended send via `structlog` and returns — there is no Resend API integration, and no "resend verification email" endpoint exists anywhere. This is a genuine gap against the story's stated scope (Resend was listed as a dependency), not a considered simplification. Needs to be picked up either as part of BE-1.3 (which also sends email) or as its own small story before launch.
+5. ~~**Email delivery is not wired up.**~~ **Resolved 2026-07-25.** `app/email.py` now calls the real Resend SDK (`resend.Emails.send`, offloaded to a thread pool executor since the SDK is synchronous), with 1 retry then a structlog ERROR log on final failure (architecture §15.2's "then Sentry" half is a plain log for now — Sentry isn't wired up until Epic 9). Config additions: `resend_api_key`, `email_from_address` (defaults to Resend's no-verification-needed sandbox sender), `frontend_base_url` (verify/reset links are built from this — they won't resolve to a real page until FE-1.x exists, which is expected). A "resend verification email" endpoint still does not exist — that remains a genuine gap, just a separate one from "is email sending real."
 6. **Audit log catalog is trimmed.** `AUDIT_LOG_ACTIONS`/`AUDIT_LOG_ENTITY_TYPES` in `app/admin/models.py` list only `USER_REGISTERED`, `USER_LOGIN`, `PASSWORD_CHANGED` / `User` — the three values Epic 1 stories emit — not the full ~20-value catalog from architecture §14.7. Extending this is a new migration (the DB `CHECK` constraint must be altered), flagged in a code comment at the definition site.
 7. **Incidental Epic 9 scope.** This story's build delivered a sliver of DEP-9.1 (repo scaffold) and DEP-9.4 (migration baseline + a working local Postgres) as a side effect, but not those stories in full — there is still no CI pipeline, no Render/Vercel provisioning, and no Sentry/observability wiring.
 
@@ -179,6 +179,7 @@ Then the system sets an HTTP-only, Secure, SameSite=Lax JWT cookie (RS256, 7-day
 - **Cookie flags (`HttpOnly`, `Secure`, `SameSite=Lax`) are set in code but not asserted by any automated test.** `httpx`'s test client cookie jar exposes only name/value, not attributes, so proving this would require parsing the raw `Set-Cookie` response header directly. This is a real gap against this story's own DoD line ("cookie is HTTP-only/Secure... confirmed") — should be closed before this is relied on as a security guarantee rather than a code-review-verified one.
 - EX-010's "any authenticated request returns 401" is only exercised against `/auth/logout` and `/auth/refresh` — the two protected endpoints that exist today. `get_current_user` is written generically, but there's nothing else yet to prove it against.
 - No test asserts the `USER_LOGIN` audit_log row's content directly (same pattern as BE-1.1's `USER_REGISTERED` gap) — written, not directly asserted.
+- **No absolute session lifetime cap (unbounded sliding renewal).** `/auth/refresh` re-signs the same `user_id`/`token_version` with a fresh 7-day `exp`, and can itself be called again before that expires — there's nothing recording when the session originally began. A token — stolen or legitimate — can therefore renew indefinitely as long as it's used at least once every 7 days; only an explicit logout or password change (both of which bump `token_version`) ever forces re-authentication. This matches the architecture doc's own documented design (§14.1) and is a deliberate simplification for V1, not an oversight — but it's the one gap worth closing (e.g. embed the original login timestamp in the JWT payload and reject refresh past a max session age, such as 30 days) before real user trust/data volume makes a stolen-and-quietly-renewed cookie a meaningful risk.
 
 **Test evidence**
 
@@ -188,7 +189,7 @@ Then the system sets an HTTP-only, Secure, SameSite=Lax JWT cookie (RS256, 7-day
 
 ## BE-1.3 — Password Reset Flow
 
-**FR-017 · Priority: Must Have** ⚠ _STAKEHOLDER SIGN-OFF PENDING (OQ-007: confirm Must Have classification, not a fast-follow)_
+**FR-017 · Priority: Must Have · Status: ✅ Implemented (2026-07-25)** ⚠ _STAKEHOLDER SIGN-OFF PENDING (OQ-007: confirm Must Have classification, not a fast-follow)_
 
 **Developer Action Plan**
 
@@ -203,27 +204,68 @@ Then the system returns the identical response ("If an account with that email e
 
 **Acceptance Criteria**
 
-- [ ] Response body and response timing are indistinguishable between an existing and non-existing email (account enumeration protection — security test in BAS §14)
-- [ ] `POST /auth/password-reset` validates token (exists, unused, ≤1 hour old); expired → "This reset link has expired. Request a new one?"; already used → "This reset link has already been used. If you did not reset your password, contact support."
-- [ ] New password validated per VR-002; on success, `password_hash` updated, `token_version` incremented (invalidates **all** active sessions, per BR-019/EX-011), token marked `used_at=now()`
-- [ ] EX-011: email delivery failure does not change the user-facing response (still the generic message); failure logged server-side for support escalation
-- [ ] EC-017: resetting the password for a never-verified account also marks the email as verified (user demonstrated control of the inbox)
-- [ ] Rate limited to 3/minute per IP
+- [~] Response body is indistinguishable between an existing and non-existing email — **true and tested**. Response *timing* is not cryptographically equalized, only practically close (see Deviation 1 below)
+- [x] `POST /auth/password-reset` validates token (exists, unused, ≤1 hour old); expired → "This reset link has expired. Request a new one?"; already used → "This reset link has already been used. If you did not reset your password, contact support."
+- [x] New password validated per VR-002; on success, `password_hash` updated, `token_version` incremented (invalidates **all** active sessions, per BR-019/EX-011), token marked `used_at=now()`
+- [ ] EX-011: email delivery failure does not change the user-facing response — **vacuously true, not meaningfully tested**; see Deviation 2 below (same underlying gap as BE-1.1)
+- [x] EC-017: resetting the password for a never-verified account also marks the email as verified
+- [x] Rate limited to 3/minute per IP
 
 **Definition of Done**
 
-- [ ] Gherkin scenarios from BAS US-021 (happy path, expired token, enumeration prevention) automated as integration tests
-- [ ] Generating a new reset token for the same `(user_id, type)` deletes the previous pending token row (HIGH-R-011)
+- [x] Gherkin-equivalent scenarios (happy path, expired token, already-used token, invalid token, enumeration prevention, second-request invalidates first link, complexity validation, rate limit) automated as integration tests — 11 new tests, all passing
+- [x] Generating a new reset token for the same `(user_id, type)` deletes the previous pending token row (HIGH-R-011) — implemented and explicitly tested
 
 **Dependencies & Integrations**
 
-- Shares the `pending_tokens` table with email verification (BE-1.1) and deletion cancellation (BE-8.2)
-- Resend for email delivery
+- Shares the `pending_tokens` table with email verification (BE-1.1) — confirmed working via the same `_consume_pending_token` code path, now shared by both flows. Deletion cancellation (BE-8.2) will be the third consumer.
+- Resend for email delivery — ✅ resolved 2026-07-25, see Deviation 2's update
 
 **Technical Constraints**
 
 - Token is an opaque, single-use value; only its SHA-256 hash is stored (`token_hash`), never the raw token
-- No behavioral branch in the code path may create a timing difference between "found" and "not found" cases
+- No behavioral branch in the code path may create a timing difference between "found" and "not found" cases — see Deviation 1 for how far this was actually taken
+
+---
+
+### Implementation Record — BE-1.3
+
+**What was actually built**
+
+- Endpoints: `POST /auth/password-reset-request`, `POST /auth/password-reset` (`app/auth/router.py`).
+- `app/auth/service.py` — added `request_password_reset` and `reset_password`. Refactored the token-validation logic that BE-1.1's `verify_email` already had (not-found/already-used/expired + tzinfo normalization) into a shared `_consume_pending_token` helper, now used by both flows instead of being duplicated a third time. `verify_email` itself was rewritten to call this helper — its behavior is unchanged, only de-duplicated (re-ran BE-1.1's existing test suite to confirm no regression).
+- `app/auth/schemas.py` — added `PasswordResetRequest`, `PasswordResetComplete`, `MessageResponse`. The password-complexity check (uppercase + digit, VR-002) that previously lived only inside `RegisterRequest` was extracted into a shared `_check_password_complexity` function so `PasswordResetComplete.new_password` enforces the identical rule rather than duplicating the logic.
+- `app/email.py` — added `send_password_reset_email` (originally a logging stub; see Deviation 2's update — since resolved).
+- No new Alembic migration — reuses `pending_tokens` from migration `0001` (the same table BE-1.1 already created, now with two token types stored in it: `email_verification` and `password_reset`).
+- 11 new tests in `tests/test_auth_password_reset.py` — 37/37 total passing across the whole auth test suite.
+- Full happy-path smoke-tested against the real PostgreSQL 16 container (register → request reset → complete reset → old password rejected → new password accepted).
+
+**Deviations from this story's spec**
+
+1. **Timing indistinguishability is "practically close," not cryptographically constant-time.** The AC's own wording ("No behavioral branch... may create a timing difference") is stricter than what's implemented. `request_password_reset` runs the same `get_user_by_email` lookup (the dominant cost) on both the found and not-found paths, but only the found path does two additional small local writes (delete old token, insert new token) and queues a BackgroundTask — a real, if small, timing difference exists between the two paths. This matches the architecture doc's own risk-acceptance language for this exact endpoint (§14.1: *"the delay introduced by... the endpoint is sufficient to prevent timing attacks at this scale"*), but it is not the byte-for-byte constant-time guarantee the AC's literal wording implies. No artificial delay/padding was added to close this gap — doing so would add latency to every legitimate request too, for a benefit that's arguably academic at this traffic scale. Flagging the gap rather than silently meeting a weaker bar than the AC states.
+2. ~~**Email delivery is still not wired to Resend.**~~ **Resolved 2026-07-25**, together with BE-1.1's identical gap (see that story's Deviation 5). `send_password_reset_email` now calls the real Resend SDK via the same `_send_with_retry` helper `send_verification_email` uses (1 retry, then a structlog ERROR log — Sentry integration is still Epic 9). EX-011's "failure logged server-side" is now genuinely testable, since there's real failure-handling logic to test against instead of an unconditional stub — see `tests/test_email.py`, added specifically to exercise this (success, retry-then-succeed, exhausts-retries-without-raising), none of which existed when this story was first marked done.
+3. **Token expiry is genuinely different per type, on purpose.** `PASSWORD_RESET_TOKEN_EXPIRY_HOURS = 1`, vs. `email_verification`'s 24 hours (`settings.email_verification_token_expiry_hours`). Both live in the same `pending_tokens` table and go through the same validation helper — only the expiry duration passed in at creation time differs, matching BAS FR-017/Workflow 8 exactly.
+
+**Known gaps / not yet verified**
+
+- No automated timing measurement exists to quantify the residual timing difference described in Deviation 1 — a flaky, low-value kind of test to automate; the mitigation is structural (identical dominant-cost lookup), not measured.
+- No test asserts the `PASSWORD_CHANGED` audit_log row's content directly (same pattern as prior stories' audit-log gaps).
+- `PasswordResetComplete.new_password` has no explicit test for the `maxLength: 128` boundary (only the complexity-rule rejection is tested).
+
+**Test evidence**
+
+`uv run pytest` → **37/37 passed** at the time this story was completed (26 from BE-1.1/BE-1.2 + 11 new). Full flow (register → request reset → complete reset → old password rejected → new password accepted) additionally smoke-tested end-to-end against the live PostgreSQL 16 dev container, no schema changes required.
+
+**Post-story follow-up — Resend integration (2026-07-25, same day)**
+
+Both this story's Deviation 2 and BE-1.1's Deviation 5 (the same underlying gap — email sending was a `structlog` stub, not real) were closed together as a single cross-cutting change, since fixing one without the other would have left `send_password_reset_email` and `send_verification_email` inconsistent. Summary:
+
+- `app/email.py` rewritten to call the real Resend SDK (`resend.Emails.send`), offloaded to a thread pool executor since the SDK is synchronous (built on `requests`); 1 retry, then a structlog ERROR log on final failure (architecture §15.2 — the "then Sentry" half is deferred to Epic 9, since Sentry isn't wired up yet)
+- New settings: `resend_api_key`, `email_from_address` (defaults to Resend's sandbox sender, no domain verification needed), `frontend_base_url` (verify/reset links are built from this; they 404 until FE-1.x exists, which is expected and fine)
+- New `tests/test_email.py` (4 tests) exercising the real send/retry logic directly against a monkeypatched `resend.Emails.send` — success, retry-then-succeed, and exhausts-retries-without-raising
+- New autouse safety-net fixture (`block_real_resend_calls` in `conftest.py`) that forces `resend.Emails.send` to fail fast in every test by default, so tests that don't explicitly mock the email functions (e.g. `test_auth_register.py`) can never make a real network call by accident — verified this actually engages (not just coincidentally passes) by running a registration test with `-s` and confirming the retry/failure log lines appear while the endpoint still returns 201
+- Total suite: **41/41 passed** (37 prior + 4 new)
+- Not done in this follow-up: a "resend verification email" endpoint (still doesn't exist — separate gap from "is sending real"), Jinja2 HTML templates (emails are inline HTML strings, adequate for V1 volume), and a live end-to-end send against the real Resend API (only exercised against a monkeypatched fake — worth a one-time manual smoke test before launch, using the user's real Resend API key, which was not shared with or used by this session)
 
 ---
 
