@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     environment: str = "development"
-    database_url: str = "postgresql+asyncpg://bursatrack:bursatrack@localhost:5432/bursatrack"
+    database_url: str = "postgresql+asyncpg://bursatrack:bursatrack@localhost:5433/bursatrack"
 
     # RS256 keypair, PEM-encoded (architecture §14.1). Stored as raw PEM content in
     # the env var, matching how Render environment variables are documented to hold it.

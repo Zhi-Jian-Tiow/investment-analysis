@@ -31,7 +31,7 @@ Each Epic's stories are split into **Backend**, **Frontend**, and **Deployment**
 
 ## BE-1.1 — User Registration & Email Verification API
 
-**FR-001 · Priority: Must Have**
+**FR-001 · Priority: Must Have · Status: ✅ Implemented (2026-07-25)**
 
 **Developer Action Plan**
 
@@ -46,34 +46,68 @@ Then a User row is created with account_status="trial", trial_expiry_date = toda
 
 **Acceptance Criteria**
 
-- [ ] `POST /auth/register` validates email (VR-001: RFC 5321, ≤254 chars, unique, lowercase-normalized), password (VR-002: 8–128 chars, ≥1 uppercase, ≥1 digit), and `password_confirm` match
-- [ ] Duplicate email returns a 409-class error, not a 500; message: "An account with this email already exists"
-- [ ] `default_broker_id` must reference an active `BrokerConfig` (VR-007)
-- [ ] User created with `token_version=0`, `email_verified=false`
-- [ ] `GET /auth/verify?token=xxx` validates the token (exists, unused, not expired), marks `email_verified=true`; expired token returns "link expired" error; already-used token returns "already used" error
-- [ ] User is **not** blocked from any feature during trial while unverified (EX-007) — verification is a security banner, not a gate
-- [ ] Registration email failure (EX-007) does not fail the registration request; a "Resend verification email" capability exists server-side
-- [ ] `audit_log` entry `USER_REGISTERED` written in the same transaction as the User/Portfolio insert
-- [ ] Rate limited to 3/minute per IP (architecture §14.4)
+- [x] `POST /auth/register` validates email (VR-001: RFC 5321, ≤254 chars, unique, lowercase-normalized), password (VR-002: 8–128 chars, ≥1 uppercase, ≥1 digit) — `password_confirm` is **not** server-validated; see Deviation 2 below
+- [x] Duplicate email is rejected, not a 500 — implemented as `422 validation_failed`, not a 409; see Deviation 3 below
+- [x] `broker_id` must reference an existing `BrokerConfig` — "active" concept not implemented; see Deviation 4 below
+- [x] User created with `token_version=0`, `email_verified=false`
+- [x] `GET /auth/verify?token=xxx` validates the token (exists, unused, not expired), marks `email_verified=true`; expired token returns "link expired" error; already-used token returns "already used" error
+- [ ] User is **not** blocked from any feature during trial while unverified (EX-007) — trivially true today (no protected routes exist yet to gate), not meaningfully tested; revisit once BE-1.2/dashboard access checks exist
+- [ ] **Not implemented:** "Resend verification email" capability — no such endpoint exists; see Deviation 5 below
+- [x] `audit_log` entry `USER_REGISTERED` written in the same transaction as the User/Portfolio insert — written, but not directly asserted by a test
+- [x] Rate limited to 3/minute per IP (architecture §14.4) — tested
 
 **Definition of Done**
 
-- [ ] Unit tests cover: happy path, duplicate email, password mismatch, invalid email format, expired/used verification token (BAS US-001 Gherkin scenarios pass)
-- [ ] Registration + Portfolio creation + audit log insert are atomic (single DB transaction)
-- [ ] No plaintext password ever logged (structlog payload sanitization verified)
-- [ ] Endpoint documented in OpenAPI spec matches `03-openapi-specification.md` `/auth/register`, `/auth/verify`
+- [x] Unit tests cover: happy path, duplicate email, password mismatch (uppercase/digit/length), invalid email format, unknown broker, rate limiting, expired/used/invalid verification token — 12/12 passing (`tests/test_auth_register.py`, `tests/test_auth_verify.py`)
+- [x] Registration + Portfolio creation + PendingToken + audit log insert are atomic (single DB transaction, one `commit()` in `auth/service.py::register_user`)
+- [x] No plaintext password ever logged — true by code inspection (no log call references the raw password); not confirmed by an automated log-capture test
+- [~] Endpoint schemas match `03-openapi-specification.md`'s `RegisterRequest`/`AuthResponse`/`UserResponse` field-for-field; FastAPI's auto-generated OpenAPI docs have not been diffed against the spec's tags/descriptions/security-scheme metadata
 
 **Dependencies & Integrations**
 
-- `BrokerConfig` seed data must exist first (Epic 9 — DB baseline) since registration requires a valid `default_broker_id`
-- Resend API key configured (email delivery)
-- `pending_tokens` table (architecture §14.1)
+- `BrokerConfig` seed data must exist first — delivered via Alembic migration `0004_seed_system_brokers`, not full Epic 9
+- ~~Resend API key configured~~ — **not done**; email sending is a logging stub, see Deviation 5
+- `pending_tokens` table (architecture §14.1) — delivered via migration `0001`
 
 **Technical Constraints**
 
 - Password hashed with bcrypt CF12, executed in a thread pool executor (MED-R-002) — must not block the async event loop
 - Email verification email sent via `BackgroundTasks`, not inline in the request/response cycle
 - `password_hash` and `token_version` must never appear in any response schema (PDPA / API security review PD requirement)
+
+---
+
+### Implementation Record — BE-1.1
+
+**What was actually built**
+
+- Backend scaffold at `backend/app/`, trimmed to only what this story needs (no Position/Lot/DividendTranche, no SystemConfig/SystemDeletionLog, no portfolio/admin HTTP routes) — a deliberate scope cut from the fuller scaffold originally drafted, per explicit direction to build story-by-story rather than pre-building ahead of need.
+- Endpoints: `POST /auth/register`, `GET /auth/verify` (`app/auth/router.py`, `service.py`, `security.py`, `schemas.py`, `models.py`).
+- Cross-module service functions (architecture P-008 — no direct cross-module table access): `app/portfolio/service.py::get_broker`/`create_portfolio`, `app/admin/service.py::record_audit_event`.
+- Alembic migrations `0001`–`0004`: `users`, `pending_tokens`, `broker_configs`, `portfolios`, `audit_log`, plus system broker seed data. This is a trimmed subset of the DB design doc's migrations 001/002/004/007 — only the tables this story touches; each migration file's docstring cross-references the corresponding section of `BursaTrack-DB-Stage3-Physical-Schema.md`.
+- `backend/docker-compose.yml` — local PostgreSQL 16 on host port **5433** (not 5432 — a pre-existing native Postgres service on the dev machine was already bound to 5432; discovered when `alembic upgrade head` initially failed with a password error against the wrong server).
+- 12 automated tests, all passing, run against isolated in-memory SQLite per test.
+- Migrations additionally verified against a live PostgreSQL 16 container (not just the SQLite test double): `upgrade head` and `downgrade base` both round-trip cleanly, and the seeded broker rows were confirmed correct via `psql`.
+
+**Deviations from this story's spec**
+
+1. **Auth library.** Architecture §7.2/§14.1 names `fastapi-users`. Not used. Hand-rolled instead: `bcrypt` (cost factor 12, off-loaded to a thread pool executor) + `PyJWT` (RS256) + a custom `pending_tokens` table for verification/reset tokens. Reason: `fastapi-users`' opinionated user model doesn't map cleanly onto this schema's custom fields (`trial_expiry_date`, `default_broker_config_id`, `token_version`, PDPA lifecycle columns) without fighting its abstractions. **Not yet reflected in the ADR record** — should be logged there before BE-1.2 builds more auth code on top of this choice.
+2. **Request shape.** Implemented to match `03-openapi-specification.md`'s `RegisterRequest` exactly: `email`, `password`, `broker_id` only. There is no server-side `password_confirm` field (that's a client-only UX concern, owned by FE-1.1) and no `default_broker_id` field name (the OpenAPI contract calls it `broker_id`). This story's own AC text (written before the OpenAPI spec was cross-checked) still refers to the old names.
+3. **Duplicate-email error shape.** Returns `422 validation_failed` with `fields: [{"field": "email", "constraint": "already registered", ...}]`, not a `409`, and not the BAS's suggested copy ("An account with this email already exists. Log in instead?"). This matches `03-openapi-specification.md`, which documents only `201`/`422`/`429` for `/auth/register` — no `409` is in the contract.
+4. **Broker validation (VR-007).** Implemented as "must reference an existing `BrokerConfig`" only. The physical schema (`BursaTrack-DB-Stage3-Physical-Schema.md` §3.4, authoritative and downstream of the BAS) has no `is_active` column on `broker_configs` — the "active broker" concept from VR-007/BAS Entity 8 was dropped somewhere between the BA and DB design stages and was never carried into the table that actually exists.
+5. **Email delivery is not wired up.** `app/email.py::send_verification_email` logs the intended send via `structlog` and returns — there is no Resend API integration, and no "resend verification email" endpoint exists anywhere. This is a genuine gap against the story's stated scope (Resend was listed as a dependency), not a considered simplification. Needs to be picked up either as part of BE-1.3 (which also sends email) or as its own small story before launch.
+6. **Audit log catalog is trimmed.** `AUDIT_LOG_ACTIONS`/`AUDIT_LOG_ENTITY_TYPES` in `app/admin/models.py` list only `USER_REGISTERED`, `USER_LOGIN`, `PASSWORD_CHANGED` / `User` — the three values Epic 1 stories emit — not the full ~20-value catalog from architecture §14.7. Extending this is a new migration (the DB `CHECK` constraint must be altered), flagged in a code comment at the definition site.
+7. **Incidental Epic 9 scope.** This story's build delivered a sliver of DEP-9.1 (repo scaffold) and DEP-9.4 (migration baseline + a working local Postgres) as a side effect, but not those stories in full — there is still no CI pipeline, no Render/Vercel provisioning, and no Sentry/observability wiring.
+
+**Known gaps / not yet verified**
+
+- `audit_log` row content is written on every registration but no test queries the table to assert it — coverage is indirect (via the code path executing without error), not direct.
+- "No plaintext password logged" is true by inspection, not by an automated test that captures log output and asserts the password is absent.
+- No line-by-line diff has been done between our Pydantic schemas and `03-openapi-specification.md`'s field descriptions, examples, or security-scheme annotations — only the field names/types/required-ness were cross-checked while writing the code.
+
+**Test evidence**
+
+`uv run pytest` → **12/12 passed**. `uv run alembic upgrade head` and `downgrade base` verified against a live PostgreSQL 16 container (`docker-compose.yml`), including a `\dt` + seed-data spot check via `psql`. Two real bugs were found and fixed while doing this (not merely written and assumed correct): an invalid single-element-tuple SQL `CHECK` constraint (Python's `repr()` of a 1-tuple has a trailing comma, which is invalid SQL), and a SQLite-vs-PostgreSQL timezone-naive/aware `datetime` comparison in the token-expiry check.
 
 ---
 
