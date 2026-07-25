@@ -113,7 +113,7 @@ Then a User row is created with account_status="trial", trial_expiry_date = toda
 
 ## BE-1.2 — Login, Logout, Session Refresh & Rate Limiting
 
-**FR-002 · Priority: Must Have**
+**FR-002 · Priority: Must Have · Status: ✅ Implemented (2026-07-25)**
 
 **Developer Action Plan**
 
@@ -126,29 +126,63 @@ Then the system sets an HTTP-only, Secure, SameSite=Lax JWT cookie (RS256, 7-day
 
 **Acceptance Criteria**
 
-- [ ] `POST /auth/login`: on success, resets failed-attempt counter to 0; on failure, increments counter and returns a generic "Email or password is incorrect" message (no account enumeration)
-- [ ] BR-016: 5 failed attempts within 10 minutes from the same IP locks further attempts for 10 minutes with message "Too many failed attempts. Please wait 10 minutes before trying again."
-- [ ] `POST /auth/logout` increments `token_version`, invalidating all existing JWTs for that user immediately
-- [ ] `POST /auth/refresh` accepts a valid non-expired JWT and issues a new 7-day JWT if `token_version` still matches; returns 401 otherwise
-- [ ] `GET /auth/jwks.json` publishes the RS256 public key
-- [ ] Session cookie is never readable by JavaScript (`HttpOnly`); verified with a security test (BAS §14 Security Test Cases)
-- [ ] EX-010: an expired/revoked JWT on any authenticated request returns 401; frontend redirects to login with "Your session has expired"
+- [x] `POST /auth/login`: on success, resets failed-attempt counter to 0; on failure, increments counter and returns a generic "Email or password is incorrect" message (no account enumeration)
+- [x] BR-016: 5 failed attempts within 10 minutes from the same IP locks further attempts for 10 minutes with message "Too many failed attempts. Please wait 10 minutes before trying again." — implemented keyed strictly by **IP**, not by account; see Deviation 2 below
+- [x] `POST /auth/logout` increments `token_version`, invalidating all existing JWTs for that user immediately
+- [x] `POST /auth/refresh` accepts a valid non-expired JWT and issues a new 7-day JWT if `token_version` still matches; returns 401 otherwise
+- [x] `GET /auth/jwks.json` publishes the RS256 public key — verified with a real cryptographic round-trip test (reconstructs the public key from the JWKS `n`/`e` and confirms it actually verifies a token signed by our private key), not just a field-presence check
+- [x] Session cookie is never readable by JavaScript (`HttpOnly=true` set in code) — **not verified by an automated test**; see Known Gaps below
+- [~] EX-010: an expired/revoked JWT on any authenticated request returns 401 — proven for the only two protected endpoints that exist so far (`/auth/logout`, `/auth/refresh`); the frontend redirect behaviour is explicitly FE-1.2 scope, not this story
 
 **Definition of Done**
 
-- [ ] Security test cases from BAS §14 pass: cookie is HTTP-only/Secure, lockout triggers at exactly 5 failures, reset token/session invalidation confirmed
-- [ ] Rate limiting via SlowAPI: 5/minute per IP on `/auth/login` (architecture §14.4)
-- [ ] `token_version` mismatch correctly rejected with `token_revoked` error code (per API error catalog, ADD-002)
+- [~] Security test cases from BAS §14: lockout-triggers-at-exactly-5-failures and session-invalidation are both automated and passing; the HTTP-only/Secure cookie-flag check is **not** automated (see Known Gaps)
+- [x] Rate limiting via SlowAPI: 5/minute per IP on `/auth/login` (architecture §14.4) — tested, including its interaction with the separately-tracked BR-016 lockout
+- [x] `token_version` mismatch correctly rejected with `token_revoked` error code (per API error catalog, ADD-002)
 
 **Dependencies & Integrations**
 
-- `fastapi-users` JWT strategy configured with RS256 key pair (`JWT_PRIVATE_KEY` Render env var)
-- SlowAPI middleware installed and configured per-route
+- ~~`fastapi-users` JWT strategy~~ — **not used**, same deviation as BE-1.1; see Deviation 1 below
+- SlowAPI middleware installed and configured per-route — reused from BE-1.1, extended to the new routes
 
 **Technical Constraints**
 
-- JWT expiry is 7 days (not 30 — HIGH-R-001/HIGH-R-010), with silent refresh handled client-side when `exp` is within 24 hours
-- No server-side session store — all session state is in the stateless JWT + `token_version` column (P-002, no Redis)
+- JWT expiry is 7 days (not 30 — HIGH-R-001/HIGH-R-010), with silent refresh handled client-side when `exp` is within 24 hours — client-side part is FE-1.2 scope
+- No server-side **session** store — session state is still the stateless JWT + `token_version` column (P-002, no Redis). The new BR-016 lockout tracker is a separate, small piece of in-process **abuse-prevention** state (not session state) — see Deviation 3 below for its limitations
+
+---
+
+### Implementation Record — BE-1.2
+
+**What was actually built**
+
+- Endpoints: `POST /auth/login`, `POST /auth/logout`, `POST /auth/refresh`, `GET /auth/jwks.json` — all in `app/auth/router.py`.
+- `app/auth/dependencies.py` (new) — `get_current_user`, a FastAPI dependency that decodes the session-cookie JWT (RS256), checks `exp`, and checks `token_version` against the DB row. This is what makes logout/refresh (and every future protected route) actually enforce revocation.
+- `app/auth/lockout.py` (new) — `LoginLockoutTracker`, the in-process BR-016/EX-009 tracker (per-IP failure counting, 10-minute window, 10-minute lockout, reset on success).
+- `app/auth/security.py` — restored `verify_password` (previously commented out as dead code since nothing called it before this story) and added `build_jwks`.
+- `app/auth/service.py` — added `authenticate_user`, `logout_user`; refactored token issuance into a shared `issue_access_token` helper used by register, login, and refresh alike.
+- `app/errors.py` — `AppError` now carries optional response `headers` (needed for `Retry-After` on the 429 lockout response); added `invalid_credentials()`, `account_locked()`, `unauthorized()` helpers.
+- 14 new tests across `tests/test_auth_login.py`, `test_auth_logout.py`, `test_auth_refresh.py`, `test_auth_jwks.py` — 26/26 total passing including BE-1.1's existing suite.
+- No new Alembic migration — this story works entirely off the existing `users` table from migration `0001`.
+- Full happy-path smoke-tested against the real PostgreSQL 16 container (register → login → refresh → jwks → logout), not just the SQLite test suite.
+
+**Deviations from this story's spec**
+
+1. **Auth library, again.** Same as BE-1.1: `fastapi-users` is not used. `get_current_user` is a ~30-line hand-rolled dependency instead. This is now the second story built on the hand-rolled approach — worth formally deciding (and recording in the ADR) rather than letting it stay implicit.
+2. **Lockout is keyed by IP, not by account.** The AC text ("resets failed-attempt counter... on failure, increments counter") reads ambiguously — could mean per-account or per-IP. Implemented per-IP because that's what BAS EX-009 explicitly says ("All further login attempts from the IP address are blocked"), and because BR-016's own title is "Account Lockout" but its body says "from the same IP address," which only makes sense as an IP-keyed block. Practical effect: a 6th failed attempt against a **different** account from the same IP is also blocked, and a 6th attempt against the **same** account from a **different** IP is not blocked. If the intent was actually per-account lockout, this needs to change.
+3. **Lockout state is in-process, not persisted.** There is no table for this in the physical schema (confirmed against all 16 tables in `BursaTrack-DB-Stage3-Physical-Schema.md` — none of them track login attempts), so, consistent with architecture P-002, it's a plain in-memory dict, exactly like SlowAPI's own rate-limit storage. Consequence: a Render restart or a second instance (NG-008 already rules out multi-instance at V1, so this is currently only the restart case) silently clears everyone's lockout state. Same caveat the architecture doc already accepts for SlowAPI; not a new risk, but now there are two independent in-process trackers with this property instead of one.
+4. **Timing-safe login added beyond the stated AC.** `authenticate_user` always runs a bcrypt check — against a precomputed dummy hash when the email doesn't exist — so the unknown-email and wrong-password paths take comparable time. Not requested by this story's AC (which only specifies message content, not timing), added because it directly serves the AC's own "no account enumeration" goal for negligible cost.
+5. **`/auth/jwks.json` has no rate limit.** Consistent with `03-openapi-specification.md`, which declares no `x-ratelimit` for this endpoint (treated as public, cacheable key material) — flagged only because it's the one endpoint in this story that isn't rate-limited, which could look like an oversight without this note.
+
+**Known gaps / not yet verified**
+
+- **Cookie flags (`HttpOnly`, `Secure`, `SameSite=Lax`) are set in code but not asserted by any automated test.** `httpx`'s test client cookie jar exposes only name/value, not attributes, so proving this would require parsing the raw `Set-Cookie` response header directly. This is a real gap against this story's own DoD line ("cookie is HTTP-only/Secure... confirmed") — should be closed before this is relied on as a security guarantee rather than a code-review-verified one.
+- EX-010's "any authenticated request returns 401" is only exercised against `/auth/logout` and `/auth/refresh` — the two protected endpoints that exist today. `get_current_user` is written generically, but there's nothing else yet to prove it against.
+- No test asserts the `USER_LOGIN` audit_log row's content directly (same pattern as BE-1.1's `USER_REGISTERED` gap) — written, not directly asserted.
+
+**Test evidence**
+
+`uv run pytest` → **26/26 passed** (12 from BE-1.1 + 14 new). Full endpoint set (`register`, `verify`, `login`, `logout`, `refresh`, `jwks.json`) additionally smoke-tested end-to-end against the live PostgreSQL 16 dev container with no schema changes required.
 
 ---
 

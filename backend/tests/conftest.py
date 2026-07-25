@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 import app.admin.models  # noqa: F401
 import app.auth.models  # noqa: F401
 import app.portfolio.models  # noqa: F401
+from app.auth.lockout import tracker as login_lockout_tracker
 from app.config import Settings, get_settings
 from app.database import Base, get_db
 from app.main import app as fastapi_app
@@ -42,6 +43,14 @@ async def reset_rate_limiter():
     # Prevents the 3/minute register limit (and others) from leaking state
     # between tests that share the same in-process Limiter.
     limiter.reset()
+    yield
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def reset_login_lockout():
+    # Same reasoning as reset_rate_limiter, for the separate BR-016 in-process
+    # login-failure tracker.
+    login_lockout_tracker.reset()
     yield
 
 
@@ -111,3 +120,20 @@ async def client(db_session, test_settings):
         yield ac
 
     fastapi_app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def client_with_cookie(client):
+    """Factory for a second client sharing the same app/dependency overrides
+    as `client`, but with an explicit, arbitrary cookie jar. Used to send a
+    specific (possibly stale/expired/malformed) session cookie for a single
+    request without touching the main `client` fixture's own cookie jar —
+    the supported alternative to httpx's now-deprecated per-request
+    `cookies=` argument.
+    """
+
+    async def _make(cookies: dict[str, str]) -> AsyncClient:
+        transport = ASGITransport(app=fastapi_app)
+        return AsyncClient(transport=transport, base_url="http://test", cookies=cookies)
+
+    return _make

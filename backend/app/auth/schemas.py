@@ -25,6 +25,31 @@ class RegisterRequest(BaseModel):
         return value
 
 
+class LoginRequest(BaseModel):
+    """Matches components/schemas/LoginRequest in 03-openapi-specification.md.
+    No minLength/complexity check on password here (unlike RegisterRequest) —
+    a legacy account could predate a password-policy change and must still be
+    able to log in with whatever password it has (API security review finding
+    IV-000). maxLength bounds a pathological request body cheaply.
+    """
+
+    email: EmailStr
+    password: str = Field(..., max_length=128)
+
+
+class JwkKey(BaseModel):
+    kty: str
+    use: str
+    alg: str
+    kid: str
+    n: str
+    e: str
+
+
+class JwksResponse(BaseModel):
+    keys: list[JwkKey]
+
+
 class UserResponse(BaseModel):
     """Public user fields only — never password_hash or token_version
     (API security review PD requirement)."""

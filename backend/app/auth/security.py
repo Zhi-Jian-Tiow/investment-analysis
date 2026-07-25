@@ -4,12 +4,14 @@ Kept free of any FastAPI/Settings coupling so it can be unit-tested directly and
 so callers (auth.service) stay in control of which settings/expiry to use.
 """
 
+import base64
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import jwt
+from cryptography.hazmat.primitives import serialization
 
 BCRYPT_COST_FACTOR = 12
 
@@ -21,8 +23,11 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_COST_FACTOR)).decode("utf-8")
 
 
-# def verify_password(password: str, password_hash: str) -> bool:
-#     return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+def verify_password(password: str, password_hash: str) -> bool:
+    """Synchronous, CPU-bound bcrypt check. Callers MUST run this in a thread
+    pool executor (MED-R-002), same as hash_password.
+    """
+    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
 
 
 def generate_raw_token() -> str:
@@ -45,3 +50,30 @@ def create_access_token(
     payload = {"user_id": user_id, "token_version": token_version, "iat": now, "exp": expires_at}
     token = jwt.encode(payload, private_key, algorithm="RS256")
     return token, expires_at
+
+
+def _b64url_uint(value: int) -> str:
+    raw = value.to_bytes((value.bit_length() + 7) // 8, byteorder="big")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def build_jwks(public_key_pem: str) -> dict:
+    """GET /auth/jwks.json (architecture §14.1). Derives the JWK's n/e from the
+    same RSA public key used to verify session JWTs, so a client fetching this
+    endpoint gets a key that actually matches what we sign with.
+    """
+    public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+    numbers = public_key.public_numbers()
+    kid = hashlib.sha256(public_key_pem.encode("utf-8")).hexdigest()[:16]
+    return {
+        "keys": [
+            {
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": kid,
+                "n": _b64url_uint(numbers.n),
+                "e": _b64url_uint(numbers.e),
+            }
+        ]
+    }
