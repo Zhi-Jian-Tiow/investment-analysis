@@ -1,6 +1,47 @@
 from functools import lru_cache
 
+from cryptography.hazmat.primitives import serialization
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# PEM header/footer candidates tried, in order, when a jwt_private_key /
+# jwt_public_key value has no "-----BEGIN ...-----" armor at all — the
+# signature of someone having pasted only the base64 body of a generated key
+# (e.g. copying between the header/footer lines rather than including them).
+# Only engaged when "BEGIN" is missing from the raw value, so a
+# correctly-armored key is never touched.
+_PRIVATE_KEY_HEADERS = [
+    ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"),  # PKCS8
+    ("-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----"),  # PKCS1
+]
+_PUBLIC_KEY_HEADERS = [
+    ("-----BEGIN PUBLIC KEY-----", "-----END PUBLIC KEY-----"),  # X.509 SubjectPublicKeyInfo
+    ("-----BEGIN RSA PUBLIC KEY-----", "-----END RSA PUBLIC KEY-----"),  # PKCS1
+]
+
+
+def _reflow_pem_body(raw: str) -> str:
+    # Also un-escapes a literal "\n" text sequence, which some .env editors
+    # introduce in place of a real newline when a multi-line value is pasted
+    # awkwardly.
+    compact = "".join(raw.replace("\\n", "\n").split())
+    return "\n".join(compact[i : i + 64] for i in range(0, len(compact), 64))
+
+
+def _repair_missing_pem_armor(raw: str, headers: list[tuple[str, str]], loader) -> str:
+    value = raw.strip()
+    if not value or "BEGIN" in value:
+        return value  # empty, or already has real armor — leave untouched
+
+    body = _reflow_pem_body(value)
+    for header, footer in headers:
+        candidate = f"{header}\n{body}\n{footer}\n"
+        try:
+            loader(candidate.encode())
+            return candidate
+        except Exception:
+            continue
+    return value  # couldn't repair it — let the original error surface downstream
 
 
 class Settings(BaseSettings):
@@ -18,6 +59,18 @@ class Settings(BaseSettings):
     jwt_private_key: str = ""
     jwt_public_key: str = ""
     jwt_access_token_expiry_days: int = 7
+
+    @field_validator("jwt_private_key")
+    @classmethod
+    def _fix_private_key_armor(cls, v: str) -> str:
+        return _repair_missing_pem_armor(
+            v, _PRIVATE_KEY_HEADERS, lambda b: serialization.load_pem_private_key(b, password=None)
+        )
+
+    @field_validator("jwt_public_key")
+    @classmethod
+    def _fix_public_key_armor(cls, v: str) -> str:
+        return _repair_missing_pem_armor(v, _PUBLIC_KEY_HEADERS, serialization.load_pem_public_key)
 
     trial_period_days: int = 14
     email_verification_token_expiry_hours: int = 24
