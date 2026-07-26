@@ -718,15 +718,15 @@ Then the Position, its Lots, and its DividendTranches are all soft-deleted
 
 **Acceptance Criteria**
 
-- [ ] Soft-delete only — no physical row deletion at this layer (A-010); records remain for audit/PDPA export until account-level hard-delete
-- [ ] Cascade covers all active Lots and DividendTranches under the Position in a single transaction
-- [ ] `audit_log` entry `POSITION_DELETED` recorded (architecture §14.7)
-- [ ] EC-006: attempting to log a dividend against a soft-deleted position (bypassing the UI) returns 404
-- [ ] EC-001 exception path: re-adding the same stock code after a soft-delete creates a **new** Position (the old soft-deleted one is not resurrected)
+- [x] Soft-delete only — no physical row deletion at this layer (A-010); records remain for audit/PDPA export until account-level hard-delete
+- [x] Cascade covers all active Lots under the Position in a single transaction. `DividendTranche` doesn't exist yet (Epic 3) — see Implementation Record.
+- [x] `audit_log` entry `POSITION_DELETED` recorded (architecture §14.7)
+- [x] EC-006 mechanism is in place (any ownership-checked write against a soft-deleted position returns 404) and verified via the Add Lot endpoint, since no dividend endpoint exists yet to test the literal AC — see Implementation Record.
+- [x] EC-001 exception path: re-adding the same stock code after a soft-delete creates a **new** Position (the old soft-deleted one is not resurrected)
 
 **Definition of Done**
 
-- [ ] Deletion is idempotent and fully reversible only via direct DB access (no "undo" UI at V1, consistent with BR — deletion confirmation copy is explicit that it "cannot be undone")
+- [x] Deletion is idempotent and fully reversible only via direct DB access (no "undo" UI at V1, consistent with BR — deletion confirmation copy is explicit that it "cannot be undone")
 
 **Dependencies & Integrations**
 
@@ -735,6 +735,33 @@ Then the Position, its Lots, and its DividendTranches are all soft-deleted
 **Technical Constraints**
 
 - Soft-deleted rows must be excluded from every dashboard/aggregate query via `WHERE is_deleted = false` — missing this filter anywhere is a correctness bug, not just a display issue (it would corrupt yield/cost totals)
+
+---
+
+### Implementation Record — BE-2.4
+
+**What was actually built**
+
+- `app/portfolio/service.py` — `delete_position`: soft-deletes the Position (`is_deleted=true`, `deleted_at=now()`), bulk-updates all its active Lots to the same soft-deleted state in the same transaction, writes a `POSITION_DELETED` audit entry, commits.
+- `app/portfolio/router.py` — `DELETE /api/v1/portfolio/positions/{id}`, authenticated, rate-limited, returns 204 with no body.
+- `app/admin/models.py` + `alembic/versions/0007_extend_audit_log_for_position_deleted.py` — extended `audit_log`'s action CHECK constraint for `POSITION_DELETED`.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **The cascade only covers Lots, not `DividendTranche`.** `DividendTranche` doesn't exist until Epic 3 (BE-3.1) — there's nothing to cascade to yet. `delete_position`'s docstring flags this explicitly so BE-3.1 doesn't forget to extend the cascade when the table lands.
+2. **EC-006 ("logging a dividend against a soft-deleted position returns 404") is tested via the Add Lot endpoint, not a dividend endpoint** — the latter doesn't exist yet. The underlying mechanism is identical either way: `get_owned_active_position` filters `is_deleted=false`, so *any* write against a soft-deleted position 404s, regardless of which endpoint. The test (`test_add_lot_to_soft_deleted_position_returns_404_ec006_precursor`) exercises that shared mechanism directly.
+3. **"Idempotent" is interpreted as "the end state never corrupts or double-applies,"** not "repeated calls return the same status code." A second `DELETE` on an already-deleted position 404s (the same ownership filter every other endpoint uses), rather than silently returning 204 again — consistent with how GET/PATCH already treat soft-deleted positions as not-found. Documented and tested explicitly (`test_delete_is_idempotent_second_call_returns_404_not_an_error`) so this interpretation is a visible decision, not an accident.
+
+**Test evidence**
+
+- `uv run pytest`: 111/111 passing (101 pre-existing + 10 new: 204 + soft-delete flags set, cascade to all active lots, audit log entry, 404-after-delete via GET, idempotent second-delete, 404 for nonexistent/foreign positions, auth requirement, the EC-006 mechanism test, and the EC-001 exception path — re-adding the same stock code after delete creates a genuinely new Position with no "existing position" warning).
+- Migration 0007 applied and rolled back cleanly against the real Postgres container.
+- Live smoke test against the real backend + Postgres: created a position with 2 lots, deleted it (204), confirmed GET now 404s, re-added the same stock code (got a new position ID, single lot, no warnings — confirming no resurrection), and confirmed a second DELETE of the original position 404s.
+
+**Known gaps / not yet verified**
+
+- The `DividendTranche` half of the cascade delete is deferred to BE-3.1, same pattern as the EC-022/EC-015 gaps in BE-2.2/BE-2.3.
+- **Epic 2 backend is now complete.** All four BE-2.x stories are implemented and verified; Epic 2's frontend stories (FE-2.1–2.4) are next.
 
 ---
 

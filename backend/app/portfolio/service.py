@@ -10,7 +10,7 @@ Epic 3 (BE-3.x) — not implemented yet.
 """
 
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -405,3 +405,33 @@ async def update_lot(
         warnings.append("Position updated. Dividend records were not changed.")
 
     return lot, warnings
+
+
+async def delete_position(db: AsyncSession, user_id: uuid.UUID, portfolio_id: uuid.UUID, position_id: uuid.UUID) -> None:
+    """BE-2.4: soft-deletes a Position and cascades to all its active Lots
+    (and, once Epic 3 exists, its DividendTranches) in a single transaction.
+    No physical row deletion (A-010) — records remain for audit/PDPA export
+    until account-level hard-delete.
+    """
+    position = await get_owned_active_position(db, portfolio_id, position_id)
+
+    now = datetime.now(timezone.utc)
+    position.is_deleted = True
+    position.deleted_at = now
+
+    await db.execute(
+        update(Lot)
+        .where(Lot.position_id == position.id, Lot.is_deleted.is_(False))
+        .values(is_deleted=True, deleted_at=now)
+    )
+
+    await record_audit_event(
+        db,
+        user_id=user_id,
+        action="POSITION_DELETED",
+        entity_type="Position",
+        entity_id=position.id,
+        metadata={"stock_code": position.stock_code},
+    )
+
+    await db.commit()

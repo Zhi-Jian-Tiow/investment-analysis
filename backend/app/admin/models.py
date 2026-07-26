@@ -22,6 +22,7 @@ AUDIT_LOG_ACTIONS = (
     "LOT_CREATED",
     "LOT_UPDATED",
     "POSITION_UPDATED",
+    "POSITION_DELETED",
 )
 
 AUDIT_LOG_ENTITY_TYPES = ("User", "Lot", "Position")

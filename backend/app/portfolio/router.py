@@ -22,6 +22,7 @@ from app.portfolio.schemas import (
 from app.portfolio.service import (
     add_lot_to_position,
     create_position,
+    delete_position,
     get_owned_active_position,
     get_portfolio_for_user,
     get_position_lots,
@@ -111,6 +112,18 @@ async def add_lot(
     response = LotResponse.model_validate(lot)
     response.warnings = warnings
     return response
+
+
+@router.delete("/portfolio/positions/{position_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("60/minute")
+async def delete_position_endpoint(
+    request: Request,
+    position_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    await delete_position(db, current_user.id, portfolio.id, position_id)
 
 
 @router.get("/portfolio/positions/{position_id}", response_model=PositionResponse)
