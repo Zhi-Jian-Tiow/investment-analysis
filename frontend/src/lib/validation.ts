@@ -43,3 +43,21 @@ export function passwordStrength(value: string): PasswordStrength {
   const labels: PasswordStrength["label"][] = ["Too weak", "Weak", "Good", "Strong"];
   return { score, label: labels[score] };
 }
+
+export interface PasswordRuleCheck {
+  label: string;
+  ok: boolean;
+}
+
+/** Live checklist rows for the reset-password screen. Deliberately mirrors
+ * VR-002 exactly — the BursaTrack Design's equivalent checklist uses
+ * different rules ("upper and lower case", "a number or symbol") that don't
+ * match what the backend actually enforces; showing those would be
+ * inaccurate, so this uses our real three checks instead. */
+export function passwordRuleChecks(value: string): PasswordRuleCheck[] {
+  return [
+    { label: "At least 8 characters", ok: value.length >= 8 },
+    { label: "One uppercase letter", ok: /[A-Z]/.test(value) },
+    { label: "One digit", ok: /[0-9]/.test(value) },
+  ];
+}

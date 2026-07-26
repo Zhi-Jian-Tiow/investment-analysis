@@ -419,7 +419,7 @@ Then they land on the portfolio dashboard, and on any subsequent page load the c
 
 ## FE-1.3 — Forgot Password / Reset Password UI
 
-**FR-017 · Priority: Must Have**
+**FR-017 · Priority: Must Have · Status: 🟡 Implemented, manual QA pending (2026-07-26)**
 
 **Developer Action Plan**
 
@@ -432,21 +432,54 @@ Then they see "If an account with that email exists, a reset link has been sent.
 
 **Acceptance Criteria**
 
-- [ ] Identical confirmation message shown regardless of account existence (no UI branch that could leak enumeration info)
-- [ ] Expired-token and already-used-token states render distinct, actionable messages (BAS Workflow 8 alternative flows)
-- [ ] On successful reset, user is redirected to `/login` with "Password updated successfully. Please log in." — no auto-login (BR-019 sessions are invalidated, this is intentional)
+- [x] Identical confirmation message shown regardless of account existence — the frontend never branches on the backend's response at all here; whatever 200 comes back is shown as the "sent" state, matching the backend's own no-enumeration guarantee
+- [x] Expired-token and already-used-token states render distinct, actionable messages — implemented as one error-card UI pattern displaying the backend's own message text directly (see Deviation 3 — the design only mocked one error variant)
+- [x] On successful reset, user is redirected to `/login` with "Password updated successfully. Please log in." — no auto-login; the reset endpoint never sets a cookie, so there's nothing to accidentally auto-login with
 
 **Definition of Done**
 
-- [ ] All three Workflow 8 alternative flows (expired, already used, happy path) covered by component tests
+- [ ] All three Workflow 8 alternative flows (expired, already used, happy path) covered by component tests — **not automated**, same frontend-tooling gap as FE-1.1/1.2
 
 **Dependencies & Integrations**
 
-- BE-1.3
+- BE-1.3 — used as-is; no backend changes needed for this story
 
 **Technical Constraints**
 
-- None beyond standard form validation using the shared password rules from VR-002
+- Standard form validation using the shared password rules from VR-002 — plus a new live rules checklist (`PasswordRulesChecklist`), added because the design added one to this screen specifically (not present on the register screen)
+
+---
+
+### Implementation Record — FE-1.3
+
+**Design source:** the user updated the same Claude Design project used for FE-1.1 to add two new screens (`isForgot`/`isReset` state flags, not present when FE-1.1 was built) — re-fetched and read fully via DesignSync before implementing.
+
+**What was actually built**
+
+- `components/auth/ForgotPasswordForm.tsx` (new) — email input → `POST /auth/password-reset-request` → replaces the form with a "Reset link sent" confirmation panel (tips box, "Use a different email", "Resend email" with a cooldown). A 429 (rate-limited) response is shown as an inline amber warning using the real `Retry-After` value from `lib/api.ts` (built in FE-1.2) rather than a guessed duration.
+- `components/auth/ResetPasswordForm.tsx` (new) — reads `token` from the URL; new-password + confirm fields with `PasswordStrengthMeter` (reused from FE-1.1) and the new `PasswordRulesChecklist`; three render states (form / error / done).
+- `components/auth/PasswordRulesChecklist.tsx` (new) + `lib/validation.ts::passwordRuleChecks()` (new) — the live 3-row checklist the design added to this screen, using our actual VR-002 rules (see Deviation 2).
+- `app/forgot-password/page.tsx`, `app/reset-password/page.tsx` (new) — the latter wrapped in `<Suspense>` for the same `useSearchParams`-on-a-static-page reason as `/login`/`/dashboard` in FE-1.2.
+- `components/auth/LoginForm.tsx` — added a second, visually distinct banner (green/success, dismissible) for `?reset=success`, alongside the existing blue session-expired banner from FE-1.2 — matches the design's `loginBanner` treatment exactly.
+
+**Deviations from the design (deliberate adaptations, not oversights)**
+
+1. **No per-token "expired" screen shown before submission.** The design models `rpStage: 'expired'` as a state the mock can jump straight into. There is no backend endpoint to check a token's validity without consuming it — the only way to find out is to actually submit a new password and see what comes back. So the real implementation always shows the form first; the error card only appears after a real 400 from `POST /auth/password-reset`. A missing `token` query param entirely is the one case caught before submission, since that's unambiguous without calling the backend at all.
+2. **Password rules checklist uses our real VR-002, not the design's rules.** The design's checklist checks "upper and lower case letters" and "a number or symbol" — neither matches what the backend (or `lib/validation.ts`) actually enforces (one uppercase letter, one digit, VR-002). Showing the design's rules verbatim would have displayed requirements that aren't real, or missed ones that are. `passwordRuleChecks()` reflects the actual three checks.
+3. **One error-card pattern covers all three backend error variants, not just "expired."** The design only mocked the expired-link case. Since BE-1.3's `_consume_pending_token` returns a distinct *message* for not-found/expired/already-used but the same `invalid_token` *code* for all three, the real implementation just displays `err.message` directly inside the design's error-card visual pattern — satisfying "distinct, actionable messages" (the distinctness comes from the backend's own text) without needing three separate hand-built screens.
+4. **No email address shown anywhere on the reset-password screen.** The design shows "Resetting the password for {email}" and later "Your new password is active for {email}" — but there is no endpoint that tells the frontend which account a reset token belongs to (by design — the token is opaque, and BE-1.3 deliberately never confirms account existence). Both lines were reworded to be account-agnostic ("Choose a strong new password for your account.", "Your new password is now active.").
+5. **Removed the design's "a confirmation email was sent" bullet from the success screen.** BE-1.3 does not send a confirmation email after a successful reset — only an audit_log entry (`PASSWORD_CHANGED`). Keeping that line would have promised something the backend doesn't do. The "Contact support" line was kept since it's accurate regardless.
+6. **The design's live "58 minutes remaining" countdown was replaced with a static statement.** There's no token-introspection endpoint to know the actual remaining time, so the info banner states the fixed 1-hour policy and the sessions-invalidated behavior (BR-019) instead of a countdown the frontend can't actually compute.
+7. **The design's "Open the reset link (demo) →" button was not built.** It's a prototype-only convenience for skipping the real email step; production users get an actual email with the real link, so this has no real-app equivalent.
+
+**Known gaps / not yet verified**
+
+- No automated tests exist for either form (same tooling gap as every FE story so far).
+- No live browser verification was performed this session — consistent with FE-1.2, no dev servers were started this time either. `npm run build` is clean across all 10 routes (2 new), and no new backend behavior was introduced (BE-1.3's existing 46-test suite already covers everything both forms call), but the actual rendered result — the live rules checklist ticking in real time, the countdown timers, the error-card copy for each of the three backend messages — is still the user's manual QA pass to do.
+
+**Test evidence**
+
+`npm run build` compiles and type-checks cleanly across all 10 routes including the 2 new pages. No backend changes were required or made for this story.
 
 ---
 

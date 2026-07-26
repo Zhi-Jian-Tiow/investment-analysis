@@ -131,6 +131,9 @@
   html {
     @apply font-sans;
   }
+  button:not(:disabled) {
+    cursor: pointer;
+  }
   a {
     color: var(--primary);
     text-decoration: none;

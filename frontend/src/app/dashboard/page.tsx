@@ -34,7 +34,7 @@ function DashboardContent() {
             <div className="text-[16.5px] font-bold tracking-tight text-foreground">BursaTrack</div>
           </div>
           <div className="flex-1" />
-          <button type="button" onClick={handleLogout} className="text-xs text-muted-foreground">
+          <button type="button" onClick={handleLogout} className="cursor-pointer text-xs text-muted-foreground">
             Log out
           </button>
           <div className="flex h-[34px] w-[34px] items-center justify-center rounded-full border border-[#D5DEFC] bg-secondary text-xs font-bold text-secondary-foreground">

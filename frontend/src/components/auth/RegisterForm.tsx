@@ -13,6 +13,7 @@ import { ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { validateEmail, validatePassword, validatePasswordConfirmation } from "@/lib/validation";
 
+import { PasswordRulesChecklist } from "./PasswordRulesChecklist";
 import { PasswordStrengthMeter } from "./PasswordStrengthMeter";
 
 interface FieldErrors {
@@ -134,6 +135,7 @@ export function RegisterForm() {
           aria-invalid={Boolean(errors.password)}
         />
         <PasswordStrengthMeter password={password} />
+        <PasswordRulesChecklist password={password} />
         {errors.password && <p className="mt-1.5 text-xs text-destructive">{errors.password}</p>}
       </div>
 

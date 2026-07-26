@@ -23,6 +23,7 @@ export function LoginForm() {
   const [error, setError] = useState<string | null>(null);
   const [lockedUntil, setLockedUntil] = useState<number | null>(null);
   const [secondsRemaining, setSecondsRemaining] = useState(0);
+  const [showResetBanner, setShowResetBanner] = useState(searchParams.get("reset") === "success");
 
   const sessionExpired = searchParams.get("reason") === "session_expired";
   const locked = lockedUntil !== null && secondsRemaining > 0;
@@ -73,6 +74,29 @@ export function LoginForm() {
     <form onSubmit={handleSubmit} noValidate>
       <h1 className="mb-1 text-xl font-bold tracking-tight text-foreground">Welcome back</h1>
       <p className="mb-5 text-[13.5px] text-muted-foreground">Log in to see your portfolio.</p>
+
+      {showResetBanner && (
+        <div
+          role="status"
+          className="mb-4 flex items-start gap-2.5 rounded-[10px] border border-[#B7E2CC] bg-[#E7F5EE] px-3.5 py-3"
+        >
+          <span className="mt-px flex h-[19px] w-[19px] shrink-0 items-center justify-center rounded-full bg-emerald-600 text-[12px] text-white">
+            ✓
+          </span>
+          <div className="flex-1">
+            <div className="text-[13.5px] font-bold text-foreground">Password updated successfully.</div>
+            <div className="mt-0.5 text-[12.5px] text-emerald-800">Please log in with your new password.</div>
+          </div>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={() => setShowResetBanner(false)}
+            className="cursor-pointer rounded p-0.5 text-base leading-none text-emerald-800 hover:no-underline"
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       {sessionExpired && !error && (
         <div className="mb-4 rounded-lg border border-secondary bg-secondary px-3.5 py-3 text-[13px] text-secondary-foreground">
