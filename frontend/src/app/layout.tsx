@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { Instrument_Sans, Spline_Sans_Mono } from "next/font/google";
 import "./globals.css";
 
+import { AuthProvider } from "@/lib/auth-context";
+
 // Matches the BursaTrack Design (BursaTrack.dc.html) exactly: Instrument Sans
 // for UI text, Spline Sans Mono for stock codes / numeric figures.
 const instrumentSans = Instrument_Sans({
@@ -28,7 +30,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={`${instrumentSans.variable} ${splineSansMono.variable}`}>
-      <body className="antialiased">{children}</body>
+      <body className="antialiased">
+        <AuthProvider>{children}</AuthProvider>
+      </body>
     </html>
   );
 }

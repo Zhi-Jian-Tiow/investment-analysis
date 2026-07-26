@@ -351,7 +351,7 @@ Backend: `uv run pytest` → **46/46 passed** (10 new: `GET /api/v1/brokers` ×2
 
 ## FE-1.2 — Login UI & Session Management
 
-**FR-002 · Priority: Must Have**
+**FR-002 · Priority: Must Have · Status: 🟡 Implemented, manual QA pending (2026-07-26)**
 
 **Developer Action Plan**
 
@@ -364,24 +364,56 @@ Then they land on the portfolio dashboard, and on any subsequent page load the c
 
 **Acceptance Criteria**
 
-- [ ] Failed login shows the generic error message; after the 5th failure within 10 minutes, the form is disabled with the lockout message and a visible countdown
-- [ ] Successful login redirects to `/dashboard`; unverified-but-active users see the persistent verification banner, not a login block (US-002 permission scenario)
-- [ ] On receiving a 401 from any API call, the client redirects to `/login` with "Your session has expired. Please log in again." and returns the user to their last-viewed page after re-authentication (EX-010)
-- [ ] Silent refresh is invisible to the user — no interruption to an active session within the 7-day window
+- [x] Failed login shows the generic error message; after the 5th failure within 10 minutes, the form is disabled with the lockout message and a visible countdown — countdown is driven by the backend's `Retry-After` header, now captured by `lib/api.ts`
+- [x] Successful login redirects to `/dashboard`; unverified-but-active users see the persistent verification banner, not a login block
+- [x] On receiving a 401 from any API call, the client redirects to `/login` with "Your session has expired. Please log in again." and returns the user to their last-viewed page after re-authentication — implemented as a global handler in `apiFetch`, with an explicit carve-out so `invalid_credentials` (a normal login-form error) never triggers it; see Deviation 2
+- [x] Silent refresh is invisible to the user — no interruption to an active session within the 7-day window — implemented as a 15-minute interval check + a window-focus check while `status === "authenticated"`, not a check on every render (see Deviation 1 for why "check the exp claim" couldn't be implemented literally)
 
 **Definition of Done**
 
-- [ ] E2E test: session expiry mid-use triggers redirect and post-login return-to-page behavior
-- [ ] No JWT or session data read/written via `document.cookie` in application code (cookie is HTTP-only by design; frontend never touches it directly)
+- [ ] E2E test: session expiry mid-use triggers redirect and post-login return-to-page behavior — **not automated** (no frontend test tooling exists yet, same gap as FE-1.1); manually reasoned through but not run in a browser this session
+- [x] No JWT or session data read/written via `document.cookie` — confirmed by code inspection; the only client-side session state is `AuthProvider`'s in-memory `user`/`expiresAt`, never persisted
 
 **Dependencies & Integrations**
 
-- BE-1.2 login/refresh endpoints
-- `SubscriptionGate` component (Epic 7) wraps protected routes and checks account status on the same request path
+- BE-1.2 login/refresh endpoints — used as-is, no backend changes needed this story (first FE story where that's true)
+- ~~`SubscriptionGate` component (Epic 7)~~ — built `AuthGate` instead: the auth-only half of what `SubscriptionGate` will eventually be. Epic 7 extends it with trial/subscription-status checks; doesn't replace it.
 
 **Technical Constraints**
 
-- All authenticated API calls go through the shared `lib/api.ts` wrapper so the refresh-check logic lives in one place, not duplicated per page
+- All authenticated API calls go through the shared `lib/api.ts` wrapper — extended, not duplicated: the global 401 handling and `Retry-After` capture live there once, used by every caller
+
+---
+
+### Implementation Record — FE-1.2
+
+**What was actually built**
+
+- `lib/api.ts` — extended `ApiError` to capture the `Retry-After` response header (`retryAfterSeconds`), and added a global handler: any 401 whose error code is `invalid_token`/`token_expired`/`token_revoked` (i.e. the session itself is dead, not a login-form rejection) triggers `window.location.href` to `/login?redirect=<current path>&reason=session_expired`. A `suppressAuthRedirect` option lets specific calls opt out (needed for the auth bootstrap check — see Deviation 2).
+- `lib/auth-context.tsx` (new) — `AuthProvider`/`useAuth()`, replacing FE-1.1's `useCurrentUser` stub hook (deleted). Holds `user`/`status` in React state and `expiresAt` in a ref; exposes `register()`, `login()`, `logout()`. Bootstraps once per full page load via `POST /auth/refresh` (suppressed redirect), then keeps the session alive via a 15-minute interval + window-focus check that silently refreshes once within 24h of the stored `expires_at`.
+- `components/auth/AuthGate.tsx` (new) — auth-only route guard: shows a loading state while `status === "loading"`, redirects to `/login?redirect=...` when `unauthenticated`, renders children when `authenticated`.
+- `components/auth/LoginForm.tsx` (new) — real login form: calls `useAuth().login()`, shows the generic `invalid_credentials` message inline, starts a live countdown from `retryAfterSeconds` and disables the form on `account_locked`/`rate_limit_exceeded`, redirects to the `redirect` query param (falling back to `/dashboard`) on success, and shows the "Your session has expired" banner when landed on via the global 401 handler's `reason=session_expired`.
+- `app/login/page.tsx` — replaced the FE-1.1 visual placeholder with `LoginForm`, wrapped in `<Suspense>` (required by Next.js for any component calling `useSearchParams` on a statically-generated page).
+- `app/dashboard/page.tsx` — replaced the ad-hoc inline auth check with `AuthGate` + `useAuth()`; added a working "Log out" action (not explicitly required by this story's AC, but there was previously no way to exercise `POST /auth/logout` from the UI at all).
+- `app/layout.tsx` — wraps the app in `AuthProvider`.
+- **A real bug caught and fixed before this was considered done:** `RegisterForm` originally called `apiFetch("/auth/register", ...)` directly, bypassing the new `AuthProvider` entirely. Since the root layout (and `AuthProvider` with it) doesn't remount on client-side navigation, `AuthProvider`'s one-time bootstrap check had already run *before* the user registered — so immediately after a successful registration, `router.push("/dashboard")` would land on `AuthGate` still holding a stale `unauthenticated` status from before the account existed, bouncing the freshly-registered user straight back to `/login`. Fixed by adding `register()` to `AuthProvider` (mirroring `login()`) and updating `RegisterForm` to call it, so the registration response feeds the same shared session state instead of bypassing it. This was caught by re-reasoning through the exact request/render sequence, not by running it in a browser — worth an explicit manual check.
+
+**Deviations from this story's spec**
+
+1. **"Checks the JWT exp claim" is not literally implementable, and isn't literally implemented.** The session cookie is HTTP-only by design (AC explicitly forbids touching `document.cookie`), so the frontend can never read the JWT's `exp` claim directly. What's actually implemented: `AuthProvider` remembers `expires_at` from the last successful login/register/refresh response (in a ref, not persisted), and a 15-minute interval plus a window-focus listener check that value against `Date.now()`, refreshing when within 24h. This satisfies the AC's intent (proactive, invisible refresh well before expiry) without being able to satisfy its literal wording.
+2. **The auth bootstrap check needed an explicit escape hatch from the global 401 handler.** Without `suppressAuthRedirect`, `AuthProvider`'s very first "am I logged in?" check on every public page (landing, register, login) would 401 for any first-time visitor and immediately redirect them to `/login` — even though "not logged in yet" on a public page is completely normal, not a session-expired event. The escape hatch exists specifically so EX-010 (genuine mid-session expiry) and "never been logged in" (every anonymous visit) are handled differently, even though both are technically a 401 from the same endpoint.
+3. **No dedicated `GET /auth/me` still means the bootstrap check calls the mutating `/auth/refresh` endpoint**, same stand-in noted in FE-1.1's record — now used more deliberately (once per page load, plus the interval/focus checks), but still not the endpoint the architecture doc would presumably specify if it addressed this gap directly.
+4. **Logout UI was added even though not in this story's AC.** There was no way to exercise `POST /auth/logout` from the browser at all before this — added a minimal "Log out" text button to the dashboard stub so the flow is actually testable end to end, not just by API tests.
+
+**Known gaps / not yet verified**
+
+- **No automated tests exist for any of this** — same tooling gap as FE-1.1 (no Vitest/RTL/Playwright set up). The lockout countdown, the 401-redirect-and-return-to-page flow, and the silent-refresh interval are all reasoned through carefully but not exercised in a real browser this session.
+- The "return to last page after re-authentication" mechanism only has `/dashboard` as a real protected destination to prove it against right now — the general `redirect` query-param mechanism is built to extend correctly as more protected routes exist (Epic 2+), but that's not yet demonstrated with a second route.
+- `AuthGate`'s loading state is a bare "Loading…" string, not styled to the design — acceptable for a stub, worth revisiting once Epic 4's real dashboard exists.
+
+**Test evidence**
+
+`npm run build` compiles and type-checks cleanly across all routes, including the two new `useSearchParams`-dependent pages (`/login`, `/dashboard`) that require the `<Suspense>` boundaries Next.js enforces for static generation. No backend changes were needed for this story — BE-1.2's existing 46-test suite (unchanged) already covers the endpoints this story consumes. No live browser verification was performed this session (backend/frontend dev servers were left untouched, following the port-conflict friction earlier in this thread) — this is the user's manual QA pass to do.
 
 ---
 

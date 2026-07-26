@@ -9,8 +9,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useBrokers } from "@/hooks/useBrokers";
-import { ApiError, apiFetch } from "@/lib/api";
-import type { AuthResponse } from "@/lib/types";
+import { ApiError } from "@/lib/api";
+import { useAuth } from "@/lib/auth-context";
 import { validateEmail, validatePassword, validatePasswordConfirmation } from "@/lib/validation";
 
 import { PasswordStrengthMeter } from "./PasswordStrengthMeter";
@@ -24,6 +24,7 @@ interface FieldErrors {
 
 export function RegisterForm() {
   const router = useRouter();
+  const { register } = useAuth();
   const { brokers, isLoading: brokersLoading } = useBrokers();
 
   const [email, setEmail] = useState("");
@@ -56,10 +57,7 @@ export function RegisterForm() {
 
     setSubmitting(true);
     try {
-      await apiFetch<AuthResponse>("/auth/register", {
-        method: "POST",
-        body: JSON.stringify({ email, password, broker_id: brokerId }),
-      });
+      await register(email, password, brokerId);
       router.push("/dashboard");
     } catch (err) {
       if (err instanceof ApiError) {
