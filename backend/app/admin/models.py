@@ -13,15 +13,16 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
 
-# Only the action/entity values Epic 1 BE stories actually emit. Extend this
-# tuple (and add a migration) as later epics introduce new audit events.
+# Only the action/entity values emitted by implemented BE stories so far.
+# Extend this tuple (and add a migration) as later epics introduce new audit events.
 AUDIT_LOG_ACTIONS = (
     "USER_REGISTERED",
     "USER_LOGIN",
     "PASSWORD_CHANGED",
+    "LOT_CREATED",
 )
 
-AUDIT_LOG_ENTITY_TYPES = ("User",)
+AUDIT_LOG_ENTITY_TYPES = ("User", "Lot")
 
 
 def _sql_in_list(values: tuple[str, ...]) -> str:

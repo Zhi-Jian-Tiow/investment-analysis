@@ -502,21 +502,21 @@ Then the server calculates initial_amount, brokerage_fee, clearing_fee, stamp_du
 
 **Acceptance Criteria**
 
-- [ ] Fee engine implements BR-001–BR-007 exactly: `brokerage = MAX(initial_amount × rate, minimum_fee)` for percentage brokers, flat fee otherwise (BR-001/002); brokerage applied per lot, not per position (BR-003); `clearing_fee = initial_amount × 0.0003`, capped at RM1,000/contract (BR-005); `stamp_duty = ROUNDUP(initial_amount / 1000, 0)`, RM1 minimum (BR-006); `all_in_cost` = sum of all four components (BR-007)
-- [ ] Rounding follows BR-025 exactly: each fee component individually rounded half-away-from-zero to 2dp before summing — verified against the worked boundary examples (RM12.575 → RM12.58)
-- [ ] Reference test cases from BAS US-003 pass numerically: Maybank Investment 5,000 CIMB @ RM8.38 → all-in RM41,996.47; MooMoo flat fee → all-in RM41,957.57; brokerage-minimum case (FM 7210, 5,000 @ RM0.60) → all-in RM3,011.90
-- [ ] VR-003 (valid Bursa stock code), VR-004 (shares ≥1, integer, ≤99,999,999), VR-005 (price >0, ≤4dp), VR-006 (purchase_date not future) all enforced with the exact BAS error copy
-- [ ] EC-001: adding a stock code that already exists as an active position is treated as "Add Lot" (BE-2.2 flow), not a duplicate Position — with the notification copy from BAS
-- [ ] EC-002: zero-brokerage (custom broker rate=0) is valid, not an error
-- [ ] EC-004: purchase date on a non-trading day is accepted with a soft warning, not blocked
-- [ ] `audit_log` entry `LOT_CREATED` written in the same transaction
+- [x] Fee engine implements BR-001–BR-007 exactly: `brokerage = MAX(initial_amount × rate, minimum_fee)` for percentage brokers, flat fee otherwise (BR-001/002); brokerage applied per lot, not per position (BR-003); `clearing_fee = initial_amount × 0.0003`, capped at RM1,000/contract (BR-005); `stamp_duty = ROUNDUP(initial_amount / 1000, 0)`, RM1 minimum (BR-006); `all_in_cost` = sum of all four components (BR-007)
+- [x] Rounding follows BR-025 exactly: each fee component individually rounded half-away-from-zero to 2dp before summing — verified against the worked boundary examples (RM12.575 → RM12.58)
+- [x] Reference test cases from BAS US-003 pass numerically: Maybank Investment 5,000 CIMB @ RM8.38 → all-in RM41,996.47; MooMoo flat fee → all-in RM41,957.57; brokerage-minimum case (FM 7210, 5,000 @ RM0.60) → all-in RM3,011.90
+- [x] VR-004 (shares ≥1, integer, ≤99,999,999), VR-005 (price >0, ≤4dp), VR-006 (purchase_date not future) enforced with the exact BAS error copy. VR-003's reference-list check is deferred to Epic 9 (see Implementation Record, Deviation 2) — only "required, non-empty" is enforced for now.
+- [x] EC-001: adding a stock code that already exists as an active position is treated as "Add Lot", not a duplicate Position — with the notification copy from BAS
+- [x] EC-002: zero-brokerage (custom broker rate=0) is valid, not an error
+- [x] EC-004: purchase date on a non-trading day is accepted with a soft warning, not blocked (weekend detection only — see Implementation Record, Deviation 3)
+- [x] `audit_log` entry `LOT_CREATED` written in the same transaction
 
 **Definition of Done**
 
-- [ ] `portfolio/calculator.py` is the single authoritative fee-calculation module — every other code path (Add Lot, Edit, Sell Calculator, CSV import) calls into it, never duplicates the formula (architecture P-003, P-005, G-001)
-- [ ] Unit test suite covers every BR-001–BR-007 case plus the P1 test matrix from BAS §14 (brokerage min/percentage/flat, clearing fee cap, stamp duty boundary)
-- [ ] No `float`/`double` anywhere in the calculation path — `Decimal` only (R-003 mitigation); a lint/mypy check flags any `float` introduced in this module
-- [ ] Response schema matches `03-openapi-specification.md` `/api/v1/portfolio/positions` (all monetary fields `type: string`, per API security review FC-001–007)
+- [x] `portfolio/calculator.py` is the single authoritative fee-calculation module — every other code path (Add Lot, Edit, Sell Calculator, CSV import) calls into it, never duplicates the formula (architecture P-003, P-005, G-001)
+- [x] Unit test suite covers every BR-001–BR-007 case plus the P1 test matrix from BAS §14 (brokerage min/percentage/flat, clearing fee cap, stamp duty boundary)
+- [x] No `float`/`double` anywhere in the calculation path — `Decimal` only (R-003 mitigation); verified manually via grep — no mypy/ruff CI gate exists in this project yet (see Implementation Record, Known gaps)
+- [x] Response schema matches `03-openapi-specification.md` `/api/v1/portfolio/positions` (all monetary fields `type: string`, per API security review FC-001–007), plus an additive `warnings` field and `stock_name` on the request (see Implementation Record, Deviations 1 and 5)
 
 **Dependencies & Integrations**
 
@@ -527,6 +527,45 @@ Then the server calculates initial_amount, brokerage_fee, clearing_fee, stamp_du
 
 - All monetary columns are PostgreSQL `NUMERIC` (never `FLOAT`); `purchase_price` is `NUMERIC(12,4)`, fee/cost fields are `NUMERIC(14,2)` (architecture §12.3)
 - The server is the sole source of truth for stored fee values — any client-side fee preview is display-only and must never be trusted or persisted (P-003)
+
+---
+
+### Implementation Record — BE-2.1
+
+**What was actually built**
+
+- `app/portfolio/calculator.py` (new) — the single authoritative fee engine: `compute_initial_amount`, `compute_brokerage_fee` (BR-001/BR-002/BR-003), `compute_clearing_fee` (BR-005, RM1,000 cap), `compute_stamp_duty` (BR-006, ROUNDUP-to-thousand with RM1 minimum), `calculate_lot_fees` (BR-007), `round_myr` (BR-025, half-away-from-zero to 2dp), and `is_non_trading_day` (EC-004, weekend check only — see Deviation 3). Decimal only throughout; verified by grep that no `float`/`double` appears anywhere in the module (no mypy/ruff config exists yet in this project to automate that check — see Known gaps).
+- `app/portfolio/models.py` — added `Position` and `Lot` ORM models (physical schema §3.6-3.7).
+- `alembic/versions/0005_create_positions_and_lots.py` (new) — creates `positions`/`lots`, and extends `audit_log`'s `action`/`entity_type` CHECK constraints to add `LOT_CREATED`/`Lot`. Verified both upgrade and downgrade against the real Postgres container.
+- `app/admin/models.py` — extended `AUDIT_LOG_ACTIONS` with `LOT_CREATED`, `AUDIT_LOG_ENTITY_TYPES` with `Lot`.
+- `app/portfolio/schemas.py` — `CreatePositionRequest` (with custom `field_validator`s reproducing VR-004/005/006's exact error copy), `LotResponse`, `PositionResponse`.
+- `app/portfolio/service.py` — `create_position` (validates broker, computes fees, handles the EC-001 duplicate-stock redirect into an add-lot instead of a new Position, writes the `LOT_CREATED` audit entry), `get_active_position_by_stock`, `get_position_lots`, `position_aggregates` (BR-010/BR-011, computed at query time — never stored on the row, per architecture ADR-004), `get_portfolio_for_user`.
+- `app/portfolio/router.py` — `POST /api/v1/portfolio/positions`, authenticated, rate-limited 60/min.
+- The `create_position`/`position_aggregates` functions are written to be reused as-is by BE-2.2's dedicated Add-Lot endpoint next story (BE-2.2's DoD explicitly requires sharing `calculator.py` — this extends that sharing to the aggregate/redirect logic too).
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **`stock_name` is accepted from the client**, even though `CreatePositionRequest` in `03-openapi-specification.md` omits it. The physical schema (§3.6) documents `positions.stock_name` as "denormalised for display; entered by user at position creation," and VR-003 requires it as mandatory — the OpenAPI schema appears to simply have missed the field. Added it as a required string (max 100 chars).
+2. **VR-003's "must be a valid Bursa-listed security" check is not enforced.** BE-2.1's own Dependencies section states the `Stock` reference table is seeded in Epic 9, which doesn't exist yet — so only "required, non-empty" is checked on `stock_code` for now, with no FK constraint from `positions.stock_code` to a `stocks` table. Revisit when Epic 9 lands.
+3. **EC-004's non-trading-day check only detects weekends**, not Malaysian public/Bursa holidays — that requires a maintained holiday-calendar data source that doesn't exist in the schema yet. The AC's intent (soft warning, never blocking) is satisfied for the weekend case; holiday coverage is a gap, not a design choice.
+4. **`system_config` (BR-015's externally-configurable stamp duty rate) doesn't exist**, so the stamp duty rate (RM1/RM1,000) and clearing-fee cap (RM1,000) are hardcoded constants in `calculator.py` with a docstring flagging them for revisit once fee-config administration is built.
+5. **Added an additive `warnings: list[str]` field to `PositionResponse`**, not present in the OpenAPI spec, to carry EC-001's "added to existing position" notice and EC-004's non-trading-day notice — purely additive, doesn't remove or change any documented field.
+6. **`PositionResponse` fields that depend on unbuilt epics are held at their documented-nullable/zero defaults**: `dividend_tranches: []`, `total_dividend_income_ytd: "0.00"` (Epic 3), `current_price`/`price_source`/`price_last_refreshed_at`/`current_market_value`/`unrealised_pnl: null` (the price-feed epic — all five are nullable in the spec for exactly this "no price ever retrieved" case, BAS EC-005).
+
+**Bug caught during live verification (fixed, not just noted)**
+
+- The first live-Postgres smoke test surfaced a real bug: `blended_purchase_price` was returned as an unrounded repeating decimal (e.g. `"8.557142857142857142857142857"`) from a plain Decimal division with no quantization. Fixed by rounding to 4dp (BR-026's price-per-share precision, matching `purchase_price`'s own column precision) in `position_aggregates`. Added a dedicated multi-lot test asserting the exact 4dp value to prevent regression.
+
+**Test evidence**
+
+- `uv run pytest`: 75/75 passing (46 pre-existing + 19 new calculator unit tests covering every BR-001–007/025 worked example and rounding boundary + 10 new endpoint integration tests covering the happy path, auth requirement, VR-004/005/006 validation copy, unknown-broker handling, EC-001 duplicate-stock redirect, EC-002 zero-brokerage, EC-004 weekend warning, and the `LOT_CREATED` audit log entry).
+- Migration 0005 applied and rolled back cleanly against the real Postgres container (`alembic upgrade head` / `downgrade -1` / `upgrade head`).
+- Live smoke test against the real backend + Postgres: registered a user, created a position, added a second lot to the same stock code (confirmed same position ID, 2 lots, aggregated totals, EC-001 notice text), triggered validation errors (zero shares, future date, 5dp price), triggered the EC-004 weekend warning, and confirmed 401 without a session cookie — all matched expectations after the `blended_purchase_price` fix above.
+
+**Known gaps / not yet verified**
+
+- No mypy/ruff tooling exists in this project yet to automate the DoD's "lint check flags any float" requirement — verified manually via `grep` instead. Worth adding real CI linting at some point, but out of scope for this story.
+- No CSV import or Sell Calculator exist yet to exercise `calculator.py` from those other call sites (both future epics) — only Add Position exercises it so far.
 
 ---
 
