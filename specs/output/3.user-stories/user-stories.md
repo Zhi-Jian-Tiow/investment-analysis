@@ -271,7 +271,7 @@ Both this story's Deviation 2 and BE-1.1's Deviation 5 (the same underlying gap 
 
 ## FE-1.1 — Registration & Onboarding UI
 
-**FR-001 · Priority: Must Have**
+**FR-001 · Priority: Must Have · Status: 🟡 Implemented, manual QA in progress (2026-07-25)**
 
 **Developer Action Plan**
 
@@ -284,27 +284,68 @@ Then they are redirected to the dashboard with a persistent banner "Please verif
 
 **Acceptance Criteria**
 
-- [ ] Inline field validation matches VR-001/VR-002 error copy exactly (e.g., "Passwords do not match", "Please enter a valid email address")
-- [ ] Broker dropdown is pre-populated from `GET /api/v1/brokers` (system brokers only at this stage)
-- [ ] Time-to-first-value: onboarding form → dashboard → first position addable in under 10 minutes end-to-end (PRD Principle 2 — this is a UX design constraint, not just a build task)
-- [ ] "Resend verification email" control visible on the banner; disabled with a cooldown after use
-- [ ] Duplicate-email error surfaces the PRD-specified copy: "An account with this email already exists. Log in instead?" with a link to `/login`
+- [x] Inline field validation matches VR-001/VR-002 error copy exactly (e.g., "Passwords do not match", "Please enter a valid email address") — `lib/validation.ts` mirrors the BAS copy verbatim
+- [x] Broker dropdown is pre-populated from `GET /api/v1/brokers` (system brokers only at this stage) — endpoint didn't exist; built as part of this story (see Deviation 3). A real bug was found and fixed during manual QA: the dropdown initially displayed the broker's UUID instead of its name after selection — see Deviation 5.
+- [ ] Time-to-first-value: onboarding form → dashboard → first position addable in under 10 minutes end-to-end — **not measured**; "first position addable" isn't buildable yet (Epic 2), so this AC can't be fully satisfied until then
+- [x] "Resend verification email" control visible on the banner; disabled with a cooldown after use — endpoint didn't exist either; built as part of this story (see Deviation 4)
+- [x] Duplicate-email error surfaces the PRD-specified copy: "An account with this email already exists. Log in instead?" with a link to `/login`
 
 **Definition of Done**
 
-- [ ] Component tested against all BAS US-001 Gherkin scenarios (happy path, duplicate email, password mismatch, invalid email)
-- [ ] Responsive from 375px viewport (NG-001 — no native app, must work on mobile web)
-- [ ] No client-side storage of password or token in localStorage/sessionStorage (architecture §8.1 — all state in React/SWR)
+- [ ] Component tested against all BAS US-001 Gherkin scenarios — **not automated**. No frontend test tooling (Vitest/RTL/Playwright) is set up yet; verification so far is `next build`'s type-check plus manual browser testing, which is still in progress as of this writing (see Known Gaps)
+- [~] Responsive from 375px viewport — built with Tailwind's responsive utilities throughout, but no explicit test/screenshot at 375px has been done
+- [x] No client-side storage of password or token in localStorage/sessionStorage — true by code inspection; all form state is `useState`, the session lives only in the HTTP-only cookie the frontend never touches directly
 
 **Dependencies & Integrations**
 
-- BE-1.1 registration/verification endpoints
-- `GET /api/v1/brokers` (Epic 8 — BrokerConfig)
+- BE-1.1 registration/verification endpoints — used as-is
+- `GET /api/v1/brokers` — ⚠ did **not** wait for Epic 8; built the minimal read-only version needed now (see Deviation 3), same pattern as prior stories pulling forward small necessary pieces
 
 **Technical Constraints**
 
-- Built with shadcn/ui + Tailwind, TypeScript strict mode
+- Built with shadcn/ui + Tailwind, TypeScript strict mode — shadcn's current CLI default ("base-nova" style) is built on **Base UI** (`@base-ui/react`), not Radix UI as the architecture doc assumes (§7.1: "Radix UI primitives"). Not a choice made here — it's shadcn's own current default — but worth recording since it's a real API difference (see Deviation 5) and the architecture doc's wording is now slightly stale.
 - Uses the shared `lib/api.ts` fetch wrapper with `credentials: include`
+
+---
+
+### Implementation Record — FE-1.1
+
+**What was actually built**
+
+- **Design source:** imported the user's Claude Design project (`BursaTrack.dc.html` + `support.js`, a `x-dc` prototype-runtime format, not React) via the DesignSync MCP tool. Extracted the actual palette, typography (Instrument Sans / Spline Sans Mono via Google Fonts), card/input/button geometry, and the exact register-screen copy and layout — then re-implemented it properly in React/Tailwind rather than porting the prototype DSL. Re-themed `globals.css`/`layout.tsx` from shadcn's default oklch/Geist theme to these values.
+- Next.js 15 project at `frontend/` (pinned to match ADR-003 exactly — the `create-next-app` CLI defaults to 16; confirmed against the architecture doc's 3 explicit "Next.js 15" mentions before scaffolding, see Deviation 1).
+- Pages: `/` (minimal landing, "Create Account" CTA), `/register` (the real FE-1.1 deliverable), `/login` (visual-only placeholder — FE-1.2 wires it up), `/dashboard` (stub redirect target — Epic 4 owns the real one).
+- Components: `AuthCard` (shared logo+card shell), `RegisterForm` (the actual form logic), `PasswordStrengthMeter` (visual aid from the design, not AC-required), `VerifyBanner` (email-verification banner with working resend + cooldown).
+- `lib/api.ts` (fetch wrapper, `credentials: include`), `lib/types.ts` (hand-written mirrors of the backend Pydantic schemas — no shared codegen exists), `lib/validation.ts` (VR-001/VR-002 client-side mirrors).
+- `hooks/useBrokers.ts` (SWR), `hooks/useCurrentUser.ts` (bootstraps the logged-in user for the dashboard stub — see Deviation 6).
+
+**Backend additions required to make this story actually work (not just look complete)**
+
+1. `GET /api/v1/brokers` — didn't exist. Added `app/portfolio/router.py` + `schemas.py` (`BrokerConfigResponse`/`BrokerListResponse`, matching `03-openapi-specification.md` exactly) + `list_brokers()` in `service.py`. The OpenAPI spec documents this endpoint as requiring auth, which is unworkable for a pre-signup registration page — resolved by adding `get_current_user_optional` to `app/auth/dependencies.py` (returns `User | None` instead of 401ing), so the one endpoint serves both the anonymous case (system brokers only) and an eventual authenticated case (system + own custom brokers).
+2. `POST /auth/resend-verification` — also didn't exist; the banner's resend button had nothing to call. Added `resend_verification_email()` in `app/auth/service.py`, reusing the exact HIGH-R-011 delete-then-insert token pattern BE-1.3 already established for password reset, applied to `email_verification` tokens. No-ops (doesn't send) if the account is already verified.
+3. **CORS middleware didn't exist at all anywhere in the backend.** Found this while wiring the frontend up — without it, every browser request from `localhost:3000` would have been silently blocked, regardless of how correct the frontend code was. Added `cors_allowed_origins` (comma-separated) to `Settings` and wired `CORSMiddleware` in `main.py` with `allow_credentials=True` (required for the HTTP-only cookie to work cross-origin) and a concrete origin list (a wildcard is invalid together with credentials, per the CORS spec). Verified via a manual `OPTIONS` preflight request that the response headers are correct.
+
+**Deviations from this story's spec**
+
+1. **Next.js 16 vs. 15.** The `create-next-app` CLI's `@latest` defaults to 16. Before scaffolding, grepped every technical-design doc for "Next.js 1[56]" — all 3 hits say "Next.js 15" (architecture §1, §7.1, ADR-003 traceability table), none say 16. Confirmed with the user before proceeding; scaffolded pinned to `create-next-app@15`.
+2. **shadcn is themed to the design, not left at its neutral default.** `globals.css`'s CSS variables were fully replaced with the BursaTrack palette (hex values, not oklch) and fonts swapped to Instrument Sans / Spline Sans Mono. This is a deliberate, necessary step for the design import to mean anything — undocumented as an explicit AC line item, but implied by "Built with shadcn/ui + Tailwind" plus the design import instruction.
+3. **`GET /api/v1/brokers` was pulled forward from Epic 8**, same reasoning as prior stories pulling forward the minimum adjacent backend piece a frontend story hard-depends on. Only the read path was built — no `POST`/`PATCH`/`DELETE` custom-broker management, which stays Epic 8 (BE-8.3) scope.
+4. **`POST /auth/resend-verification` didn't exist in any prior story's scope.** BE-1.1's Implementation Record explicitly flagged this as a gap ("no such endpoint exists") — closed here because FE-1.1's AC hard-requires a *working* resend control, not a decorative one.
+5. **Base UI, not Radix — and it caused a real bug.** shadcn's current default style (`base-nova`) generates components on `@base-ui/react`, not Radix UI. This mattered concretely: Base UI's `Select.Value` does not auto-derive its displayed label from the matching `SelectItem`'s children the way Radix's does — it shows the raw `value` (the broker's UUID) unless given an explicit `children` render function. Manual QA caught this (broker dropdown showed a UUID instead of "Maybank IB" etc. after selection); fixed by passing `<SelectValue>{(value) => brokers.find(b => b.id === value)?.name ?? placeholder}</SelectValue>`. Worth remembering for every other `Select` usage in this codebase going forward.
+6. **`useCurrentUser` bootstraps via `POST /auth/refresh`, not a dedicated read endpoint.** No `GET /auth/me` exists. Calling the mutating refresh endpoint unconditionally on every dashboard mount is a reasonable stand-in for a stub page, but isn't the real silent-refresh design (checking the JWT's `exp` first) — FE-1.2 should replace this rather than build alongside it.
+7. **Password strength meter** — visual-only, matches the design, not requested by this story's AC (which only requires validation *messages*, not a live strength indicator). Low-cost addition, not the source of truth for whether a password is accepted.
+
+**Known gaps / not yet verified**
+
+- **No automated frontend tests exist.** This story's own DoD line ("component tested against all BAS US-001 Gherkin scenarios") is unmet by anything automated — only `next build`'s type-check and manual browser testing cover it.
+- **Manual browser QA is in progress, not complete, as of this record.** No `chromium-cli` was available in this environment and the user declined the Chrome automation extension, so verification is being done by the user directly rather than captured as a screenshot/automated check from this session. Two issues surfaced so far: the broker-label bug above (fixed), and a `jwt.exceptions.InvalidKeyError: Could not parse the provided public key` runtime error — **this is a local environment configuration issue, not a code defect**: the user's `backend/.env` still has the literal `...` placeholder from `.env.example` in place of a real generated RSA keypair. Fix is in progress (generating a real keypair); not yet confirmed resolved at the time of this update.
+- 375px-viewport responsiveness is unverified by an actual narrow-viewport check.
+- "Time-to-first-value under 10 minutes" is structurally plausible (single-screen form) but not measured, and can't be fully measured until Epic 2's Add Position form exists.
+- No accessibility audit has been done (focus states, ARIA labelling beyond what shadcn/Base UI provide by default).
+
+**Test evidence**
+
+Backend: `uv run pytest` → **46/46 passed** (10 new: `GET /api/v1/brokers` ×2, `POST /auth/resend-verification` ×3, plus the CORS/dependency changes covered indirectly by the existing suite continuing to pass). Frontend: `npm run build` compiles and type-checks cleanly across all 4 routes. Both dev servers were confirmed live in this session (`/health` 200, `localhost:3000` 200) and a manual CORS preflight (`OPTIONS /auth/register` with `Origin: http://localhost:3000`) returned the expected `access-control-allow-credentials: true` / `access-control-allow-origin: http://localhost:3000` headers. End-to-end browser verification is the user's own manual QA pass, still in progress.
 
 ---
 
