@@ -84,6 +84,7 @@ class Position(Base):
     stock_code: Mapped[str] = mapped_column(String, nullable=False)
     stock_name: Mapped[str] = mapped_column(String, nullable=False)
     category_tag: Mapped[str] = mapped_column(String, nullable=False, default="Dividend")
+    notes: Mapped[str | None] = mapped_column(String, nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

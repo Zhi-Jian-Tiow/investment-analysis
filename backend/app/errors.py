@@ -77,3 +77,16 @@ def unauthorized(error: str, message: str) -> AppError:
     token_expired, or token_revoked (per the API error catalog, ADD-002).
     """
     return AppError(401, error, message)
+
+
+def version_conflict() -> AppError:
+    """409 version_conflict — optimistic-locking failure on a Lot/Position
+    PATCH: the submitted `version` no longer matches the stored row (BE-2.3,
+    EX-008, architecture §15.4). Message text matches
+    03-openapi-specification.md's documented example exactly.
+    """
+    return AppError(
+        409,
+        "version_conflict",
+        "This record was modified by another session. Please refresh and try again.",
+    )

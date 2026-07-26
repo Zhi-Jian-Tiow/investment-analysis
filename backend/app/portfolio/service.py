@@ -14,14 +14,14 @@ from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.service import record_audit_event
-from app.errors import not_found, validation_error
+from app.errors import not_found, validation_error, version_conflict
 from app.portfolio.calculator import calculate_lot_fees, is_non_trading_day
 from app.portfolio.models import BrokerConfig, Lot, Portfolio, Position
-from app.portfolio.schemas import CreateLotRequest, CreatePositionRequest
+from app.portfolio.schemas import CreateLotRequest, CreatePositionRequest, UpdateLotRequest, UpdatePositionRequest
 
 
 async def get_broker(db: AsyncSession, broker_id: uuid.UUID) -> BrokerConfig | None:
@@ -213,6 +213,7 @@ async def create_position(
             stock_code=data.stock_code,
             stock_name=data.stock_name,
             category_tag=data.category_tag,
+            notes=data.notes,
         )
         db.add(position)
         await db.flush()
@@ -265,4 +266,142 @@ async def add_lot_to_position(
 
     await db.commit()
     await db.refresh(lot)
+    return lot, warnings
+
+
+async def get_owned_lot(db: AsyncSession, position_id: uuid.UUID, lot_id: uuid.UUID) -> Lot:
+    """Ownership verified on both the position and the lot — `lot.position_id`
+    must equal the `{id}` in the path — to prevent cross-position lot access
+    even within the same user's own portfolio (03-openapi-specification.md
+    PATCH .../lots/{lot_id} description). Returns 404, never 403, matching
+    get_owned_active_position's pattern.
+    """
+    result = await db.execute(
+        select(Lot).where(Lot.id == lot_id, Lot.position_id == position_id, Lot.is_deleted.is_(False))
+    )
+    lot = result.scalar_one_or_none()
+    if lot is None:
+        raise not_found()
+    return lot
+
+
+async def update_position_metadata(
+    db: AsyncSession, user_id: uuid.UUID, portfolio_id: uuid.UUID, position_id: uuid.UUID, data: UpdatePositionRequest
+) -> Position:
+    """BE-2.3: metadata-only edit (category_tag/notes) — lot financial fields
+    are never touched here.
+    """
+    position = await get_owned_active_position(db, portfolio_id, position_id)
+
+    previous_values = {"category_tag": position.category_tag, "notes": position.notes}
+
+    if data.category_tag is not None:
+        position.category_tag = data.category_tag
+    if data.notes is not None:
+        position.notes = data.notes
+
+    new_values = {"category_tag": position.category_tag, "notes": position.notes}
+
+    await record_audit_event(
+        db,
+        user_id=user_id,
+        action="POSITION_UPDATED",
+        entity_type="Position",
+        entity_id=position.id,
+        metadata={"previous_values": previous_values, "new_values": new_values},
+    )
+
+    await db.commit()
+    await db.refresh(position)
+    return position
+
+
+async def update_lot(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    portfolio_id: uuid.UUID,
+    position_id: uuid.UUID,
+    lot_id: uuid.UUID,
+    data: UpdateLotRequest,
+) -> tuple[Lot, list[str]]:
+    """BE-2.3: edits a Lot's financial fields using optimistic locking on
+    `version`. Every field is optional except `version` — unsupplied fields
+    keep their current stored value, and all four fee components are always
+    recomputed from the resulting shares/purchase_price/broker (never
+    accepted directly from the client, P0-API-002).
+    """
+    await get_owned_active_position(db, portfolio_id, position_id)
+    lot = await get_owned_lot(db, position_id, lot_id)
+
+    if data.broker_id is not None:
+        broker = await get_broker(db, data.broker_id)
+        if broker is None:
+            raise validation_error(
+                "One or more fields failed validation.",
+                fields=[{"field": "broker_id", "constraint": "must reference an existing broker", "received": None}],
+            )
+    else:
+        broker = await get_broker(db, lot.broker_config_id)
+        assert broker is not None, "an existing lot must always reference a valid broker"
+
+    new_shares = data.shares if data.shares is not None else lot.shares
+    new_purchase_price = data.purchase_price if data.purchase_price is not None else lot.purchase_price
+    new_purchase_date = data.purchase_date if data.purchase_date is not None else lot.purchase_date
+
+    previous_values = {
+        "shares": lot.shares,
+        "purchase_price": str(lot.purchase_price),
+        "purchase_date": lot.purchase_date.isoformat(),
+        "broker_id": str(lot.broker_config_id),
+        "all_in_cost": str(lot.all_in_cost),
+    }
+
+    fees = calculate_lot_fees(new_shares, new_purchase_price, broker)
+
+    result = await db.execute(
+        update(Lot)
+        .where(Lot.id == lot_id, Lot.version == data.version)
+        .values(
+            shares=new_shares,
+            purchase_price=new_purchase_price,
+            purchase_date=new_purchase_date,
+            broker_config_id=broker.id,
+            initial_amount=fees.initial_amount,
+            brokerage_fee=fees.brokerage_fee,
+            clearing_fee=fees.clearing_fee,
+            stamp_duty=fees.stamp_duty,
+            all_in_cost=fees.all_in_cost,
+            version=Lot.version + 1,
+        )
+    )
+    if result.rowcount == 0:
+        await db.rollback()
+        raise version_conflict()
+
+    new_values = {
+        "shares": new_shares,
+        "purchase_price": str(new_purchase_price),
+        "purchase_date": new_purchase_date.isoformat(),
+        "broker_id": str(broker.id),
+        "all_in_cost": str(fees.all_in_cost),
+    }
+    await record_audit_event(
+        db,
+        user_id=user_id,
+        action="LOT_UPDATED",
+        entity_type="Lot",
+        entity_id=lot.id,
+        metadata={"previous_values": previous_values, "new_values": new_values},
+    )
+
+    await db.commit()
+    await db.refresh(lot)
+
+    warnings = _purchase_date_warnings(new_purchase_date)
+    if data.shares is not None:
+        # EC-015: a share-count edit never alters previously stored
+        # DividendTranche.total_amount — surfaced as a notice since
+        # DividendTranche doesn't exist yet to actually verify against.
+        warnings.append("Position updated. Dividend records were not changed.")
+
     return lot, warnings

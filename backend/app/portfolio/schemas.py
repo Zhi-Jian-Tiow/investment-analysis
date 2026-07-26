@@ -6,7 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _CATEGORY_TAGS = ("Dividend", "Volatile", "Growth")
 
@@ -129,6 +129,57 @@ class CreateLotRequest(BaseModel):
         return _check_purchase_date(value)
 
 
+class UpdatePositionRequest(BaseModel):
+    """Matches components/schemas/UpdatePositionRequest in
+    03-openapi-specification.md — metadata only (category_tag, notes); lot
+    financial fields are edited via UpdateLotRequest instead.
+    """
+
+    category_tag: str | None = None
+    notes: str | None = Field(None, max_length=500)
+
+    @field_validator("category_tag")
+    @classmethod
+    def validate_category_tag(cls, value: str | None) -> str | None:
+        if value is not None and value not in _CATEGORY_TAGS:
+            raise ValueError(f"category_tag must be one of {_CATEGORY_TAGS}")
+        return value
+
+
+class UpdateLotRequest(BaseModel):
+    """Matches components/schemas/UpdateLotRequest in
+    03-openapi-specification.md. At least one of shares/purchase_price/
+    broker_id/purchase_date must be present in addition to `version`.
+    """
+
+    shares: int | None = None
+    purchase_price: Decimal | None = None
+    broker_id: UUID | None = None
+    purchase_date: date | None = None
+    version: int = Field(..., ge=1)
+
+    @field_validator("shares")
+    @classmethod
+    def validate_shares(cls, value: int | None) -> int | None:
+        return _check_shares(value) if value is not None else value
+
+    @field_validator("purchase_price")
+    @classmethod
+    def validate_purchase_price(cls, value: Decimal | None) -> Decimal | None:
+        return _check_purchase_price(value) if value is not None else value
+
+    @field_validator("purchase_date")
+    @classmethod
+    def validate_purchase_date(cls, value: date | None) -> date | None:
+        return _check_purchase_date(value) if value is not None else value
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self) -> "UpdateLotRequest":
+        if self.shares is None and self.purchase_price is None and self.broker_id is None and self.purchase_date is None:
+            raise ValueError("At least one of shares, purchase_price, broker_id, or purchase_date must be provided")
+        return self
+
+
 class LotResponse(BaseModel):
     """Matches components/schemas/LotResponse in 03-openapi-specification.md.
 
@@ -169,6 +220,11 @@ class PositionResponse(BaseModel):
 
     `warnings` is additive (not in the OpenAPI spec) — carries EC-001's
     "added to existing position" notice and EC-004's non-trading-day notice.
+
+    `notes` is also additive: CreatePositionRequest/UpdatePositionRequest both
+    accept it, but the documented PositionResponse/PositionSummaryResponse
+    schemas never include it in the read side — an apparent spec gap. Added
+    here so a value the user set can actually be read back.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -177,6 +233,7 @@ class PositionResponse(BaseModel):
     stock_code: str
     stock_name: str
     category_tag: str
+    notes: str | None = None
     total_shares: int
     total_all_in_cost: Decimal
     blended_purchase_price: Decimal

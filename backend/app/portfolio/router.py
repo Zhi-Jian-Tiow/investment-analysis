@@ -8,19 +8,53 @@ from app.auth.models import User
 from app.database import get_db
 from app.rate_limit import limiter
 
-from .schemas import (
+from app.portfolio.models import Lot, Position
+from app.portfolio.schemas import (
     BrokerConfigResponse,
     BrokerListResponse,
     CreateLotRequest,
     CreatePositionRequest,
     LotResponse,
     PositionResponse,
+    UpdateLotRequest,
+    UpdatePositionRequest,
 )
-from .service import add_lot_to_position, create_position, get_portfolio_for_user, list_brokers, position_aggregates
+from app.portfolio.service import (
+    add_lot_to_position,
+    create_position,
+    get_owned_active_position,
+    get_portfolio_for_user,
+    get_position_lots,
+    list_brokers,
+    position_aggregates,
+    update_lot,
+    update_position_metadata,
+)
 
 # Dividend/Dashboard/Sell-Calculator routes belong to Epics 3-4. Position/Lot
-# creation is added here (BE-2.1, BE-2.2); Edit/Delete follow in BE-2.3-2.4.
+# creation is added in BE-2.1/BE-2.2; edit (this file) in BE-2.3; delete in BE-2.4.
 router = APIRouter(prefix="/api/v1", tags=["Portfolio"])
+
+
+def _build_position_response(
+    position: Position, lots: list[Lot], warnings: list[str] | None = None
+) -> PositionResponse:
+    total_shares, total_all_in_cost, blended_purchase_price = position_aggregates(lots)
+    return PositionResponse(
+        id=position.id,
+        stock_code=position.stock_code,
+        stock_name=position.stock_name,
+        category_tag=position.category_tag,
+        notes=position.notes,
+        total_shares=total_shares,
+        total_all_in_cost=total_all_in_cost,
+        blended_purchase_price=blended_purchase_price,
+        lots=[LotResponse.model_validate(lot) for lot in lots],
+        is_deleted=position.is_deleted,
+        created_at=position.created_at,
+        updated_at=position.updated_at,
+        warnings=warnings or [],
+    )
 
 
 @router.get("/brokers", response_model=BrokerListResponse)
@@ -31,10 +65,16 @@ async def get_brokers(
     current_user: User | None = Depends(get_current_user_optional),
 ) -> BrokerListResponse:
     brokers = await list_brokers(db, user_id=current_user.id if current_user else None)
-    return BrokerListResponse(brokers=[BrokerConfigResponse.model_validate(b) for b in brokers])
+    return BrokerListResponse(
+        brokers=[BrokerConfigResponse.model_validate(b) for b in brokers]
+    )
 
 
-@router.post("/portfolio/positions", response_model=PositionResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/portfolio/positions",
+    response_model=PositionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 @limiter.limit("60/minute")
 async def add_position(
     request: Request,
@@ -43,28 +83,17 @@ async def add_position(
     current_user: User = Depends(get_current_user),
 ) -> PositionResponse:
     portfolio = await get_portfolio_for_user(db, current_user.id)
-    position, lots, warnings = await create_position(db, current_user.id, portfolio.id, body)
-
-    total_shares, total_all_in_cost, blended_purchase_price = position_aggregates(lots)
-
-    return PositionResponse(
-        id=position.id,
-        stock_code=position.stock_code,
-        stock_name=position.stock_name,
-        category_tag=position.category_tag,
-        total_shares=total_shares,
-        total_all_in_cost=total_all_in_cost,
-        blended_purchase_price=blended_purchase_price,
-        lots=[LotResponse.model_validate(lot) for lot in lots],
-        is_deleted=position.is_deleted,
-        created_at=position.created_at,
-        updated_at=position.updated_at,
-        warnings=warnings,
+    position, lots, warnings = await create_position(
+        db, current_user.id, portfolio.id, body
     )
+
+    return _build_position_response(position, lots, warnings)
 
 
 @router.post(
-    "/portfolio/positions/{position_id}/lots", response_model=LotResponse, status_code=status.HTTP_201_CREATED
+    "/portfolio/positions/{position_id}/lots",
+    response_model=LotResponse,
+    status_code=status.HTTP_201_CREATED,
 )
 @limiter.limit("60/minute")
 async def add_lot(
@@ -75,7 +104,70 @@ async def add_lot(
     current_user: User = Depends(get_current_user),
 ) -> LotResponse:
     portfolio = await get_portfolio_for_user(db, current_user.id)
-    lot, warnings = await add_lot_to_position(db, current_user.id, portfolio.id, position_id, body)
+    lot, warnings = await add_lot_to_position(
+        db, current_user.id, portfolio.id, position_id, body
+    )
+
+    response = LotResponse.model_validate(lot)
+    response.warnings = warnings
+    return response
+
+
+@router.get("/portfolio/positions/{position_id}", response_model=PositionResponse)
+@limiter.limit("60/minute")
+async def get_position(
+    request: Request,
+    position_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PositionResponse:
+    """Not part of any Epic 2 BE story's own AC, but flagged as a required
+    gap at the end of BE-2.2: FE-2.2's position detail page and its
+    SWR-driven aggregate revalidation need somewhere to read a Position's
+    current state from, and this reuses BE-2.1's response-building logic
+    entirely.
+    """
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    position = await get_owned_active_position(db, portfolio.id, position_id)
+    lots = await get_position_lots(db, position.id)
+
+    return _build_position_response(position, lots)
+
+
+@router.patch("/portfolio/positions/{position_id}", response_model=PositionResponse)
+@limiter.limit("60/minute")
+async def patch_position(
+    request: Request,
+    position_id: UUID,
+    body: UpdatePositionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PositionResponse:
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    position = await update_position_metadata(
+        db, current_user.id, portfolio.id, position_id, body
+    )
+    lots = await get_position_lots(db, position.id)
+
+    return _build_position_response(position, lots)
+
+
+@router.patch(
+    "/portfolio/positions/{position_id}/lots/{lot_id}", response_model=LotResponse
+)
+@limiter.limit("60/minute")
+async def patch_lot(
+    request: Request,
+    position_id: UUID,
+    lot_id: UUID,
+    body: UpdateLotRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LotResponse:
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    lot, warnings = await update_lot(
+        db, current_user.id, portfolio.id, position_id, lot_id, body
+    )
 
     response = LotResponse.model_validate(lot)
     response.warnings = warnings
