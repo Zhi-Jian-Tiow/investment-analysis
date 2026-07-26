@@ -586,15 +586,15 @@ Then the server calculates the new lot's fees independently (BR-003: brokerage p
 
 **Acceptance Criteria**
 
-- [ ] `total_shares` = SUM(shares) across non-deleted lots (BR-010); `total_all_in_cost` = SUM(all_in_cost) across non-deleted lots (BR-011); `blended_purchase_price` = total_initial_amount / total_shares
-- [ ] **P0 critical invariant:** existing `DividendTranche.total_amount` and `qualifying_shares` values on the position are unchanged by this operation — verified by the CI-001/BR-009/EC-022 regression test (see BE-3.1 for the full invariant definition)
-- [ ] Numeric example from BAS US-004 passes: adding a 2,000-share lot at RM9.00 to an existing 5,000-share CIMB position brings total shares to 7,000, total all-in cost to RM60,037.87, and leaves a previously-stored RM1,000.00 dividend tranche untouched
-- [ ] Broker for the new lot defaults to the position's existing default broker but is overridable per lot
+- [x] `total_shares` = SUM(shares) across non-deleted lots (BR-010); `total_all_in_cost` = SUM(all_in_cost) across non-deleted lots (BR-011); `blended_purchase_price` = total_initial_amount / total_shares
+- [x] **P0 critical invariant (partial):** verified that adding a Lot never mutates any other Lot's own stored fields. The full invariant (that `DividendTranche.total_amount`/`qualifying_shares` also stay untouched) cannot be tested yet — `DividendTranche` doesn't exist until Epic 3 — see Implementation Record for the precursor test and the note to extend it in BE-3.1.
+- [x] Numeric example from BAS US-004 passes: adding a 2,000-share lot at RM9.00 to an existing 5,000-share CIMB position brings total shares to 7,000, total all-in cost to RM60,037.87 (the dividend-tranche half of this AC is deferred to BE-3.1 per above)
+- [x] Broker for the new lot is overridable per lot (BR-003). "Defaults to the position's existing default broker" is a frontend pre-fill concern (FE-2.2) — the backend has no notion of a position-level default broker; `broker_id` is simply required per request, same as BE-2.1.
 
 **Definition of Done**
 
-- [ ] Regression test explicitly named after EC-022 exists in the automated suite and is treated as a P0/blocking test — this is the single most safety-critical test in the codebase per BAS §14
-- [ ] Position aggregates are computed at query time, never stored redundantly on the Position row (architecture ADR-004, §12.3 HIGH-R-006)
+- [x] A precursor regression test exists now (`test_add_lot_does_not_mutate_existing_lot_ec022_precursor`); the full EC-022 test naming/scope from BAS §14 applies once `DividendTranche` exists (BE-3.1) — flagged there as P0/blocking.
+- [x] Position aggregates are computed at query time, never stored redundantly on the Position row (architecture ADR-004, §12.3 HIGH-R-006) — reuses BE-2.1's `position_aggregates`.
 
 **Dependencies & Integrations**
 
@@ -603,6 +603,33 @@ Then the server calculates the new lot's fees independently (BR-003: brokerage p
 **Technical Constraints**
 
 - Same Decimal/NUMERIC constraints as BE-2.1
+
+---
+
+### Implementation Record — BE-2.2
+
+**What was actually built**
+
+- `app/portfolio/service.py` — `add_lot_to_position` (the new endpoint's core logic), `get_owned_active_position` (ownership check returning 404 for missing/foreign/soft-deleted positions), `_insert_lot` and `_purchase_date_warnings` (both extracted from BE-2.1's `create_position` so the Lot-construction/audit-logging/EC-004-warning logic has exactly one implementation, now shared by both the EC-001 redirect path in BE-2.1 and this story's dedicated endpoint).
+- `app/portfolio/schemas.py` — `CreateLotRequest`; refactored the VR-004/005/006 field validators out of `CreatePositionRequest` into shared module-level functions (`_check_shares`, `_check_purchase_price`, `_check_purchase_date`) so `CreateLotRequest` reuses the exact same validation, not a re-implementation. Added the same additive `warnings` field to `LotResponse` that `PositionResponse` already has.
+- `app/portfolio/router.py` — `POST /api/v1/portfolio/positions/{position_id}/lots`, authenticated, rate-limited 60/min, returns `LotResponse`.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **The P0 EC-022/BR-009 regression test cannot be fully written yet.** Its entire premise — that adding a Lot must not alter a previously-stored `DividendTranche.total_amount` — requires `DividendTranche` to exist, and it doesn't until Epic 3 (BE-3.1). Wrote a precursor test now (`test_add_lot_does_not_mutate_existing_lot_ec022_precursor`) that asserts the half of the invariant that *is* testable today (another Lot's own stored fields never change), and left an explicit note that BE-3.1 must extend this into the real, full invariant test the spec describes. This is flagged as a known gap, not silently satisfied.
+2. **No GET position-detail endpoint was built.** The story's AC talks about aggregates "recalculating" after an add-lot, but the documented response for this endpoint (`03-openapi-specification.md`) is `LotResponse`, not `PositionResponse` — the new totals are only ever visible on a subsequent read. No Epic 2 backend story actually specifies a `GET /positions/{id}` endpoint (it only appears as a path-block sibling of BE-2.3's PATCH/BE-2.4's DELETE in the OpenAPI doc), so it wasn't built here to avoid scope creep. This is a real backlog gap: FE-2.2's "position detail page" and its SWR revalidation will need this endpoint to exist, so it must land before or alongside FE-2.2 — flagging that now rather than discovering it mid-frontend-story.
+3. **"Broker defaults to the position's existing default broker"** has no backend equivalent — positions don't store a default broker (only individual Lots do). Implemented as a plain required `broker_id` on the request; the "defaults to" behavior is a UI pre-fill decision that belongs entirely to FE-2.2.
+
+**Test evidence**
+
+- `uv run pytest`: 85/85 passing (75 pre-existing + 10 new: BAS US-004 numeric match, aggregate-visible-on-next-read, per-lot broker override, auth requirement, 404 for nonexistent/foreign/soft-deleted positions, EC-004 weekend warning, `LOT_CREATED` audit entry, and the EC-022 precursor above).
+- Live smoke test against the real backend + Postgres: created a position, added a lot with a *different* broker than the position's first lot (confirmed independent per-lot fee calculation), confirmed 404 for a nonexistent position and 401 unauthenticated.
+- Note: this session's smoke test also surfaced an environment quirk worth recording — `uv run fastapi dev` crashed on startup with a `UnicodeEncodeError` from `rich`'s console renderer on this Windows/cp1252 terminal (unrelated to any app code); setting `PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8` before the command fixed it. Not an application bug, just a note for future manual runs in this environment.
+
+**Known gaps / not yet verified**
+
+- `GET /api/v1/portfolio/positions/{id}` doesn't exist yet — needed before FE-2.2 can build a position detail page (see Deviation 2).
+- The full EC-022/BR-009 dividend-invariant test is deferred to BE-3.1 (see Deviation 1).
 
 ---
 

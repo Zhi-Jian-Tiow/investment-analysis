@@ -1,5 +1,5 @@
 """Broker-list schemas (FE-1.1) plus Position/Lot create-and-response schemas
-(BE-2.1). DividendTranche schemas belong to Epic 3 (BE-3.x).
+(BE-2.1, BE-2.2). DividendTranche schemas belong to Epic 3 (BE-3.x).
 """
 
 from datetime import date, datetime
@@ -9,6 +9,32 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _CATEGORY_TAGS = ("Dividend", "Volatile", "Growth")
+
+
+def _check_shares(value: int) -> int:
+    # VR-004 — shared by every request schema that creates/edits a Lot.
+    if value < 1:
+        raise ValueError("Number of shares must be greater than zero")
+    if value > 99_999_999:
+        raise ValueError("Number of shares cannot exceed 99,999,999")
+    return value
+
+
+def _check_purchase_price(value: Decimal) -> Decimal:
+    # VR-005
+    if value <= 0:
+        raise ValueError("Purchase price must be greater than zero")
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -4:
+        raise ValueError("Purchase price can have at most 4 decimal places")
+    return value
+
+
+def _check_purchase_date(value: date) -> date:
+    # VR-006
+    if value > date.today():
+        raise ValueError("Purchase date cannot be in the future")
+    return value
 
 
 class BrokerConfigResponse(BaseModel):
@@ -56,31 +82,17 @@ class CreatePositionRequest(BaseModel):
     @field_validator("shares")
     @classmethod
     def validate_shares(cls, value: int) -> int:
-        # VR-004
-        if value < 1:
-            raise ValueError("Number of shares must be greater than zero")
-        if value > 99_999_999:
-            raise ValueError("Number of shares cannot exceed 99,999,999")
-        return value
+        return _check_shares(value)
 
     @field_validator("purchase_price")
     @classmethod
     def validate_purchase_price(cls, value: Decimal) -> Decimal:
-        # VR-005
-        if value <= 0:
-            raise ValueError("Purchase price must be greater than zero")
-        exponent = value.as_tuple().exponent
-        if isinstance(exponent, int) and exponent < -4:
-            raise ValueError("Purchase price can have at most 4 decimal places")
-        return value
+        return _check_purchase_price(value)
 
     @field_validator("purchase_date")
     @classmethod
     def validate_purchase_date(cls, value: date) -> date:
-        # VR-006
-        if value > date.today():
-            raise ValueError("Purchase date cannot be in the future")
-        return value
+        return _check_purchase_date(value)
 
     @field_validator("category_tag")
     @classmethod
@@ -90,8 +102,40 @@ class CreatePositionRequest(BaseModel):
         return value
 
 
+class CreateLotRequest(BaseModel):
+    """Matches components/schemas/CreateLotRequest in
+    03-openapi-specification.md — adds a lot to an already-existing position,
+    so no stock_code/stock_name/category_tag here (those live on the Position).
+    """
+
+    shares: int
+    purchase_price: Decimal
+    broker_id: UUID
+    purchase_date: date
+
+    @field_validator("shares")
+    @classmethod
+    def validate_shares(cls, value: int) -> int:
+        return _check_shares(value)
+
+    @field_validator("purchase_price")
+    @classmethod
+    def validate_purchase_price(cls, value: Decimal) -> Decimal:
+        return _check_purchase_price(value)
+
+    @field_validator("purchase_date")
+    @classmethod
+    def validate_purchase_date(cls, value: date) -> date:
+        return _check_purchase_date(value)
+
+
 class LotResponse(BaseModel):
-    """Matches components/schemas/LotResponse in 03-openapi-specification.md."""
+    """Matches components/schemas/LotResponse in 03-openapi-specification.md.
+
+    `warnings` is additive (not in the OpenAPI spec) — carries EC-004's
+    non-trading-day notice, consistent with PositionResponse's own `warnings`
+    (BE-2.1).
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -109,6 +153,7 @@ class LotResponse(BaseModel):
     version: int
     created_at: datetime
     updated_at: datetime
+    warnings: list[str] = Field(default_factory=list)
 
 
 class PositionResponse(BaseModel):

@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -6,11 +8,18 @@ from app.auth.models import User
 from app.database import get_db
 from app.rate_limit import limiter
 
-from .schemas import BrokerConfigResponse, BrokerListResponse, CreatePositionRequest, LotResponse, PositionResponse
-from .service import create_position, get_portfolio_for_user, list_brokers, position_aggregates
+from .schemas import (
+    BrokerConfigResponse,
+    BrokerListResponse,
+    CreateLotRequest,
+    CreatePositionRequest,
+    LotResponse,
+    PositionResponse,
+)
+from .service import add_lot_to_position, create_position, get_portfolio_for_user, list_brokers, position_aggregates
 
 # Dividend/Dashboard/Sell-Calculator routes belong to Epics 3-4. Position/Lot
-# creation is added here (BE-2.1); Add Lot/Edit/Delete follow in BE-2.2-2.4.
+# creation is added here (BE-2.1, BE-2.2); Edit/Delete follow in BE-2.3-2.4.
 router = APIRouter(prefix="/api/v1", tags=["Portfolio"])
 
 
@@ -52,3 +61,22 @@ async def add_position(
         updated_at=position.updated_at,
         warnings=warnings,
     )
+
+
+@router.post(
+    "/portfolio/positions/{position_id}/lots", response_model=LotResponse, status_code=status.HTTP_201_CREATED
+)
+@limiter.limit("60/minute")
+async def add_lot(
+    request: Request,
+    position_id: UUID,
+    body: CreateLotRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LotResponse:
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    lot, warnings = await add_lot_to_position(db, current_user.id, portfolio.id, position_id, body)
+
+    response = LotResponse.model_validate(lot)
+    response.warnings = warnings
+    return response
