@@ -66,6 +66,41 @@ function DashboardContent() {
           <Button onClick={() => setAddPositionOpen(true)}>+ Add Position</Button>
         </div>
 
+        {portfolio && (
+          <div className="mb-5.5 grid grid-cols-[repeat(auto-fit,minmax(215px,1fr))] gap-3.5">
+            <div className="rounded-xl border border-border bg-card px-5 py-4.5">
+              <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                Total All-In Cost
+              </div>
+              <div className="mt-1.5 text-2xl font-bold tracking-tight">
+                {formatMoney(portfolio.total_all_in_cost)}
+              </div>
+              <div className="mt-1 text-xs text-tertiary">
+                {positions.length} position{positions.length === 1 ? "" : "s"}
+              </div>
+            </div>
+            <div className="rounded-xl border border-border bg-card px-5 py-4.5">
+              <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                Dividend Income YTD
+              </div>
+              <div className="mt-1.5 text-2xl font-bold tracking-tight text-[#177A4E]">
+                {formatMoney(portfolio.total_dividend_income_ytd)}
+              </div>
+              <div className="mt-1 text-xs text-tertiary">Dividend tracking arrives in a later epic</div>
+            </div>
+            <div className="rounded-xl border border-border bg-card px-5 py-4.5">
+              <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">Blended Yield</div>
+              <div className="mt-1.5 text-2xl font-bold tracking-tight text-muted-foreground">—</div>
+              <div className="mt-1 text-xs text-tertiary">Income ÷ all-in cost — needs dividend tracking</div>
+            </div>
+            <div className="rounded-xl border border-border bg-card px-5 py-4.5">
+              <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">Next Dividend</div>
+              <div className="mt-1.5 text-[16.5px] font-bold text-muted-foreground">—</div>
+              <div className="mt-1 text-xs text-tertiary">Dividend calendar arrives in a later epic</div>
+            </div>
+          </div>
+        )}
+
         {isLoading && (
           <div className="rounded-xl border border-border bg-card p-10 text-center text-sm text-muted-foreground">
             Loading portfolio…
@@ -87,32 +122,32 @@ function DashboardContent() {
               <table className="w-full min-w-[860px] border-collapse text-[13.5px]">
                 <thead>
                   <tr className="border-b border-border">
-                    <th className="px-3.5 py-3 text-left text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                    <th className="px-3.5 py-3 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                       Stock
                     </th>
-                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                       Shares
                     </th>
-                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                       Blended Price
                     </th>
-                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                       All-In Cost
                     </th>
-                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                       Current Price
                     </th>
-                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                       Income YTD
                     </th>
-                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                       Yield
                     </th>
                   </tr>
                 </thead>
                 <tbody>
                   {positions.map((position) => (
-                    <tr key={position.id} className="border-b border-[#F0F0ED] last:border-0">
+                    <tr key={position.id} className="border-b border-[#F0F0ED] last:border-0 hover:bg-[#FAFAF8]">
                       <td className="px-3.5 py-3">
                         <Link
                           href={`/positions/${position.id}`}
@@ -120,9 +155,7 @@ function DashboardContent() {
                         >
                           <div>
                             <div className="font-semibold text-foreground">{position.stock_name}</div>
-                            <div className="font-mono text-[11.5px] text-muted-foreground">
-                              {position.stock_code}
-                            </div>
+                            <div className="font-mono text-[11.5px] text-tertiary">{position.stock_code}</div>
                           </div>
                           <span
                             className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${CATEGORY_TAG_STYLES[position.category_tag] ?? CATEGORY_TAG_STYLES.Dividend}`}
@@ -142,7 +175,7 @@ function DashboardContent() {
                 </tbody>
               </table>
             </div>
-            <div className="border-t border-[#F0F0ED] bg-[#FAFAF8] px-3.5 py-2.5 font-mono text-xs text-muted-foreground">
+            <div className="border-t border-[#F0F0ED] bg-[#FAFAF8] px-3.5 py-2.5 font-mono text-xs text-tertiary">
               Current price, income, and yield require the price-feed and dividend features (later epics).
             </div>
           </div>

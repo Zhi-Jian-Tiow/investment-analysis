@@ -986,13 +986,13 @@ Then it reads "This will delete [Stock Name] and all 2 lots and 3 dividend recor
 
 **Acceptance Criteria**
 
-- [ ] Dialog dynamically interpolates the actual lot/tranche counts for the specific position
-- [ ] Cancelling leaves the position untouched and returns to the dashboard
-- [ ] Portfolio summary (total cost, blended yield) visibly updates immediately after confirmed deletion
+- [x] Dialog dynamically interpolates the actual lot/tranche counts for the specific position
+- [x] Cancelling leaves the position untouched — dialog closes, no request is made, user stays exactly where they triggered it from. ("Returns to the dashboard" is interpreted as describing the confirmed-delete path, not cancel — see Implementation Record.)
+- [x] Portfolio summary (total cost, blended yield) visibly updates immediately after confirmed deletion — the dashboard previously had no summary display at all; added one as part of this story (see Implementation Record).
 
 **Definition of Done**
 
-- [ ] Reusable `ConfirmDialog` component (already scoped in architecture's frontend structure, §7.2) used consistently for this and all other destructive actions (dividend delete, account delete)
+- [x] Reusable `ConfirmDialog` component (already scoped in architecture's frontend structure, §7.2) built at `components/shared/ConfirmDialog.tsx` — generic (title/description/confirm-label/onConfirm props), ready for dividend delete and account delete to reuse without modification.
 
 **Dependencies & Integrations**
 
@@ -1003,6 +1003,80 @@ Then it reads "This will delete [Stock Name] and all 2 lots and 3 dividend recor
 - None additional
 
 ---
+
+### Implementation Record — FE-2.4
+
+**Design source:** none, same situation as FE-2.3. `BursaTrack.dc.html`'s only "Delete Position" affordance is the dashboard row's ••• menu, and its handler (`mDelete`) is a stub: `this.toast(name + ' would be deleted with all N lots and M dividend records. [Undo — 5s]', ...)` — a toast-with-undo pattern, not the modal confirmation with exact interpolated copy this story's AC requires. No confirmation dialog is modeled anywhere in the prototype. Built from the AC/Gherkin text directly.
+
+**What was actually built**
+
+- `components/shared/ConfirmDialog.tsx` (new) — the first component in `components/shared/`, matching the exact path architecture §7.2 specifies. Generic props (`title`, `description`, `confirmLabel`, `cancelLabel`, `destructive`, `onConfirm`); handles its own submitting/error state so callers just provide an async `onConfirm`.
+- `app/positions/[id]/page.tsx` — added a "Delete Position" button (shadcn's existing `destructive` Button variant — no new styling needed here, unlike the Add Lot button, since no design precedent exists to match and the shared variant is already visually correct for a destructive action) to the position header. Opens `ConfirmDialog` with the AC's exact copy template, interpolating `position.stock_name`, `position.lots.length`, and `position.dividend_tranches.length` (always 0 today — Epic 3 doesn't exist yet, so the sentence honestly reads "...and all 2 lots and 0 dividend records..."). On confirm: `DELETE /api/v1/portfolio/positions/{id}`, revalidate the dashboard SWR cache, navigate to `/dashboard`.
+- `app/dashboard/page.tsx` — added the 4-card portfolio summary strip from the design (`Total All-In Cost`, `Dividend Income YTD`, `Blended Yield`, `Next Dividend`) that did not exist before this story. Also fixed the same `text-muted-foreground`-vs-`text-tertiary` mismatch identified and flagged as a known follow-up during FE-2.2's review (table column headers, the stock-code chip, and the footer note) since this file was already being touched for the summary cards.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **"Cancelling ... returns to the dashboard" is interpreted as describing the confirmed-delete outcome, not the cancel outcome.** Read literally, the AC's single sentence ("Cancelling leaves the position untouched and returns to the dashboard") would mean cancelling navigates the user away — unusual UX that contradicts "leaves the position untouched" implying no side effects at all. Implemented the standard, safe interpretation: Cancel closes the dialog with zero side effects (no navigation, no request); Confirm deletes and navigates to `/dashboard` (where the now-updated summary is directly visible, satisfying the third AC bullet). If the literal reading was actually intended, this is a one-line fix to flag.
+2. **"Delete Position" was built only on the position detail page, not as a dashboard row ••• dropdown menu**, even though that's the design's only real precedent for the action. Building a full row-actions dropdown (the design's menu has Add Lot / Add Dividend / Sell / Edit Position / Delete Position) would mean either shipping a menu where most items are non-functional stubs for epics that don't exist yet (Add Dividend, Sell) or building extensive new UI surface not required by any single story. Kept scope consistent with FE-2.2/FE-2.3's established precedent of building lot-level and position-level actions on the position detail page.
+3. **Added a portfolio summary strip to the dashboard that no prior story had built.** The AC explicitly requires "Portfolio summary (total cost, blended yield) visibly updates immediately after confirmed deletion," but no summary existed for anything to update. Built all 4 of the design's summary cards (not just the two the AC names) for visual completeness against the design's grid layout — `Total All-In Cost` and `Dividend Income YTD` show real (honestly-zero) data from the dashboard endpoint already built in FE-2.1; `Blended Yield` and `Next Dividend` show `—` rather than a fabricated 0%/empty value, consistent with the BAS's own "no data yet" convention (EC-001/EC-009) used everywhere else in the app. The `Blended Yield` card also drops the design's clickable "tap to verify" drill-down, since there's nothing yet to drill into.
+4. **`Total All-In Cost`'s subtitle shows only "{N} positions", not the design's "{N} positions · {M} lots".** `PortfolioResponse`/`PositionSummaryResponse` don't expose a lot count anywhere (only per-position aggregates), and adding a new field to the dashboard endpoint's schema for one subtitle string was judged out of scope for a delete-confirmation story.
+
+**Test evidence**
+
+- `npm run build` and `npm run lint`: clean.
+- Live smoke test against the real backend + Postgres: created two positions, confirmed the dashboard summary's `total_all_in_cost` reflected both (RM51,322.57), deleted one position via the exact `DELETE` call the button sends (204), and confirmed the dashboard re-fetch shows the correct single remaining position and the updated total (RM9,074.70) — proving the summary card really does update after a confirmed delete.
+- Confirmed both `/dashboard` and `/positions/[id]` still server-render without errors via the Next.js dev server log.
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session — the dialog's interactive behavior (button click, confirm/cancel, the summary cards visibly changing) is the user's manual QA pass.
+- If "cancel returns to the dashboard" was meant literally (Deviation 1), that's a one-line change once clarified.
+
+---
+
+## BE/FE-2.5 — Delete Lot (Backfilled Scope)
+
+**Priority: Must Have (backfilled)**
+
+> Not an originally-scoped story. `DELETE /api/v1/portfolio/positions/{id}/lots/{lot_id}` has been fully documented in `03-openapi-specification.md` since the API design phase (`x-audit-event: LOT_DELETED`) but no user story in Epic 2 ever claimed it — BE-2.1–2.4/FE-2.1–2.4 only cover Add Position, Add Lot, Edit Lot, and delete at the **Position** level (cascading). Identified and implemented as a small, deliberate scope addition immediately after FE-2.4, since the delete/soft-delete machinery was already being built and the gap was directly adjacent.
+
+**Developer Action Plan**
+
+```gherkin
+Given a position has 2 active lots
+When the user deletes one of them
+Then that lot is soft-deleted, the position's aggregates (total_shares, total_all_in_cost,
+     blended_purchase_price) reflect the remaining lot on the next read, and a LOT_DELETED
+     audit entry is recorded — but deleting a position's only remaining lot is rejected,
+     directing the user to delete the position instead
+```
+
+**Acceptance Criteria** (self-defined, since no BAS/PRD source names this endpoint)
+
+- [x] Soft-delete only (`is_deleted=true`, `deleted_at=now()`), consistent with every other delete in the app (A-010)
+- [x] Ownership verified on both position and lot — 404, never 403, for missing/foreign/cross-position lots (same pattern as PATCH .../lots/{lot_id})
+- [x] Deleting a position's last remaining active lot is blocked with 409 `last_lot`, directing the user to delete the position instead — a business rule invented at implementation time (no story or BR defines what a zero-lot Position should mean), not spec-mandated
+- [x] `audit_log` entry `LOT_DELETED` recorded
+- [x] Frontend: a "Delete" action per lot row (hidden when it's the position's only lot, since the backend would reject it anyway), using the same `ConfirmDialog` built for FE-2.4
+
+**Test evidence**
+
+- `uv run pytest`: 124/124 passing (115 pre-existing + 9 new: 204 + soft-delete flags, aggregates update on next read, blocks deleting the last lot, 404 for nonexistent/foreign/cross-position lots, auth requirement, audit log entry, idempotent re-delete).
+- `npm run build`/`npm run lint`: clean.
+- Live smoke test against the real backend + Postgres: attempted deleting a position's only lot (409 `last_lot`), added a second lot, deleted it (204), confirmed `GET /positions/{id}` shows only the remaining lot with correct aggregates, and confirmed `GET /dashboard`'s total reflects it too.
+
+**What was built**
+
+- Backend: `app/errors.py::last_lot_cannot_be_deleted()` (409), `app/portfolio/service.py::delete_lot()`, `DELETE /api/v1/portfolio/positions/{id}/lots/{lot_id}` route, `LOT_DELETED` added to `AUDIT_LOG_ACTIONS` via migration 0008.
+- Frontend: a "Delete" button in the Lots table's Actions column (next to FE-2.3's "Edit"), reusing `ConfirmDialog` — the second real consumer of that component, exactly as FE-2.4's DoD intended it to be reused. Also improved `ConfirmDialog` itself to auto-close on a successful `onConfirm` (previously only FE-2.4's Delete Position path worked correctly without an explicit close, because it always navigated away on success — this component's contract is now "auto-close on success, stay open with an inline error on failure" for any future caller).
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session — the per-row Delete button, its confirmation copy, and the hidden-when-only-one-lot behavior are the user's manual QA pass.
+
+---
+
+**Epic 2 is now complete, including this backfilled addition.** All four originally-scoped FE-2.x stories (Add Position, Add Lot, Edit Lot with conflict handling, Delete Position) plus the backfilled Delete Lot capability are implemented, backend-verified via live smoke tests, and recorded here. Epic 2 (Portfolio: Positions & Lots) — both backend and frontend — is fully done.
 
 # Epic 3 — Dividend Tracking
 

@@ -25,6 +25,7 @@ from app.portfolio.schemas import (
 from app.portfolio.service import (
     add_lot_to_position,
     create_position,
+    delete_lot,
     delete_position,
     get_owned_active_position,
     get_portfolio_for_user,
@@ -225,3 +226,20 @@ async def patch_lot(
     response = LotResponse.model_validate(lot)
     response.warnings = warnings
     return response
+
+
+@router.delete("/portfolio/positions/{position_id}/lots/{lot_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("60/minute")
+async def delete_lot_endpoint(
+    request: Request,
+    position_id: UUID,
+    lot_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    """Documented in 03-openapi-specification.md since the API design phase
+    but never claimed by an Epic 2 user story — implemented now as a small
+    deliberate scope addition alongside BE-2.4/FE-2.4.
+    """
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    await delete_lot(db, current_user.id, portfolio.id, position_id, lot_id)

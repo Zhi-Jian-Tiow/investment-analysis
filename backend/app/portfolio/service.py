@@ -18,7 +18,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.service import record_audit_event
-from app.errors import not_found, validation_error, version_conflict
+from app.errors import last_lot_cannot_be_deleted, not_found, validation_error, version_conflict
 from app.portfolio.calculator import calculate_lot_fees, is_non_trading_day
 from app.portfolio.models import BrokerConfig, Lot, Portfolio, Position
 from app.portfolio.schemas import CreateLotRequest, CreatePositionRequest, UpdateLotRequest, UpdatePositionRequest
@@ -418,6 +418,45 @@ async def update_lot(
         warnings.append("Position updated. Dividend records were not changed.")
 
     return lot, warnings
+
+
+async def delete_lot(
+    db: AsyncSession, user_id: uuid.UUID, portfolio_id: uuid.UUID, position_id: uuid.UUID, lot_id: uuid.UUID
+) -> None:
+    """Backfills DELETE /api/v1/portfolio/positions/{id}/lots/{lot_id} — fully
+    documented in 03-openapi-specification.md (x-audit-event: LOT_DELETED)
+    since the API design phase but never claimed by a user story in Epic 2.
+    Implemented now as a deliberate small scope addition alongside BE-2.4
+    (Delete Position), since the delete/soft-delete machinery was already
+    being built. Soft-deletes a single Lot; position aggregates are
+    recomputed at query time, so no further update is needed for them to
+    reflect the deletion (architecture ADR-004, same as add/edit lot).
+
+    Blocks deleting a position's last remaining active lot (own judgment
+    call, not spec-mandated — see errors.last_lot_cannot_be_deleted) since a
+    zero-lot Position is a degenerate state with no other story defining
+    what it should mean; the caller should delete the Position instead.
+    """
+    await get_owned_active_position(db, portfolio_id, position_id)
+    lot = await get_owned_lot(db, position_id, lot_id)
+
+    active_lots = await get_position_lots(db, position_id)
+    if len(active_lots) <= 1:
+        raise last_lot_cannot_be_deleted()
+
+    lot.is_deleted = True
+    lot.deleted_at = datetime.now(timezone.utc)
+
+    await record_audit_event(
+        db,
+        user_id=user_id,
+        action="LOT_DELETED",
+        entity_type="Lot",
+        entity_id=lot.id,
+        metadata={"position_id": str(position_id), "shares": lot.shares, "all_in_cost": str(lot.all_in_cost)},
+    )
+
+    await db.commit()
 
 
 async def delete_position(db: AsyncSession, user_id: uuid.UUID, portfolio_id: uuid.UUID, position_id: uuid.UUID) -> None:

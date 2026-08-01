@@ -2,15 +2,18 @@
 
 import Decimal from "decimal.js";
 import Link from "next/link";
-import { useParams, useSearchParams } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AddLotDialog } from "@/components/portfolio/AddLotDialog";
 import { EditLotDialog } from "@/components/portfolio/EditLotDialog";
+import { ConfirmDialog } from "@/components/shared/ConfirmDialog";
+import { Button } from "@/components/ui/button";
 import { useBrokers } from "@/hooks/useBrokers";
 import { useDashboard } from "@/hooks/useDashboard";
 import { usePosition } from "@/hooks/usePosition";
+import { apiFetch } from "@/lib/api";
 import { brokerNote } from "@/lib/fee-calculator";
 import { CATEGORY_TAG_STYLES } from "@/lib/category-tags";
 import type { BrokerConfigResponse } from "@/lib/types";
@@ -31,12 +34,15 @@ function formatDate(value: string): string {
 
 function PositionDetailContent() {
   const params = useParams<{ id: string }>();
+  const router = useRouter();
   const searchParams = useSearchParams();
   const { position, isLoading, error, mutate: revalidatePosition } = usePosition(params.id);
   const { brokers } = useBrokers();
   const { mutate: revalidateDashboard } = useDashboard();
   const [addLotOpen, setAddLotOpen] = useState(false);
   const [editingLotId, setEditingLotId] = useState<string | null>(null);
+  const [deletingLotId, setDeletingLotId] = useState<string | null>(null);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
 
   const [notice, setNotice] = useState<string | null>(searchParams.get("notice"));
 
@@ -57,6 +63,22 @@ function PositionDetailContent() {
   }
 
   const editingLot = position?.lots.find((l) => l.id === editingLotId) ?? null;
+  const deletingLot = position?.lots.find((l) => l.id === deletingLotId) ?? null;
+
+  async function handleDeletePosition() {
+    if (!position) return;
+    await apiFetch(`/api/v1/portfolio/positions/${position.id}`, { method: "DELETE" });
+    await revalidateDashboard();
+    router.push("/dashboard");
+  }
+
+  async function handleDeleteLot() {
+    if (!position || !deletingLot) return;
+    await apiFetch(`/api/v1/portfolio/positions/${position.id}/lots/${deletingLot.id}`, { method: "DELETE" });
+    await revalidatePosition();
+    await revalidateDashboard();
+    setNotice("Lot deleted.");
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -122,6 +144,9 @@ function PositionDetailContent() {
                   </div>
                   {position.notes && <div className="mt-1 text-[13px] text-muted-foreground">{position.notes}</div>}
                 </div>
+                <Button variant="destructive" size="sm" onClick={() => setDeleteDialogOpen(true)}>
+                  Delete Position
+                </Button>
               </div>
               <div className="mt-4.5 flex flex-wrap gap-7 text-[13.5px]">
                 <div>
@@ -245,6 +270,15 @@ function PositionDetailContent() {
                             >
                               Edit
                             </button>
+                            {position.lots.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => setDeletingLotId(lot.id)}
+                                className="cursor-pointer rounded-[5px] px-1.5 py-1 text-[12.5px] font-semibold text-destructive hover:bg-destructive/10"
+                              >
+                                Delete
+                              </button>
+                            )}
                           </td>
                         </tr>
                       );
@@ -274,6 +308,28 @@ function PositionDetailContent() {
           lot={editingLot}
           revalidatePosition={revalidatePosition}
           onSaved={handleLotEdited}
+        />
+      )}
+      {position && (
+        <ConfirmDialog
+          open={deleteDialogOpen}
+          onOpenChange={setDeleteDialogOpen}
+          title="Delete position?"
+          description={`This will delete ${position.stock_name} and all ${position.lots.length} lot${position.lots.length === 1 ? "" : "s"} and ${position.dividend_tranches.length} dividend record${position.dividend_tranches.length === 1 ? "" : "s"}. This cannot be undone.`}
+          confirmLabel="Delete Position"
+          onConfirm={handleDeletePosition}
+        />
+      )}
+      {position && deletingLot && (
+        <ConfirmDialog
+          open={Boolean(deletingLotId)}
+          onOpenChange={(next) => {
+            if (!next) setDeletingLotId(null);
+          }}
+          title="Delete this lot?"
+          description={`This will delete the ${deletingLot.shares.toLocaleString("en-MY")}-share lot purchased on ${formatDate(deletingLot.purchase_date)}. This cannot be undone.`}
+          confirmLabel="Delete Lot"
+          onConfirm={handleDeleteLot}
         />
       )}
     </div>

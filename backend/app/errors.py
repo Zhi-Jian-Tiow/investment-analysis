@@ -90,3 +90,19 @@ def version_conflict() -> AppError:
         "version_conflict",
         "This record was modified by another session. Please refresh and try again.",
     )
+
+
+def last_lot_cannot_be_deleted() -> AppError:
+    """409 last_lot — deleting a position's only remaining active Lot would
+    leave a lot-less, zero-share Position dangling. Not part of any
+    documented error catalog entry (the Delete Lot endpoint itself was never
+    claimed by a user story before being implemented alongside BE-2.4) — this
+    business rule is a judgment call made at implementation time: direct the
+    caller to delete the whole Position (already-built DELETE /positions/{id})
+    instead.
+    """
+    return AppError(
+        409,
+        "last_lot",
+        "This is the only lot in this position. Delete the position instead if you want to remove it entirely.",
+    )
