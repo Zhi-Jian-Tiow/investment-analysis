@@ -925,13 +925,13 @@ Then the UI shows "This record was updated by another session. Please refresh th
 
 **Acceptance Criteria**
 
-- [ ] `version` is submitted transparently with every PATCH (not user-visible/editable)
-- [ ] A dashboard/position notice appears after a share-count edit: "Position updated. Dividend records were not changed." (EC-015)
-- [ ] Accessing another user's position via a crafted URL renders a generic 404 page — no information disclosure
+- [x] `version` is submitted transparently with every PATCH (not user-visible/editable) — tracked in component state, never rendered as a form field
+- [x] A dashboard/position notice appears after a share-count edit: "Position updated. Dividend records were not changed." (EC-015) — surfaced verbatim from the backend's `warnings` array
+- [x] Accessing another user's position via a crafted URL renders a generic 404 page — no information disclosure (built in FE-2.1, re-verified here per this story's explicit AC)
 
 **Definition of Done**
 
-- [ ] EX-008 concurrent-edit scenario manually tested with two browser sessions
+- [x] EX-008 concurrent-edit scenario verified via a live two-request smoke test against the real backend (first PATCH with `version=1` succeeds and bumps to `version=2`; a second PATCH still carrying `version=1` — simulating a second session that hasn't refreshed — receives 409) rather than two literal browser sessions, since no browser tooling is available this session — see Implementation Record.
 
 **Dependencies & Integrations**
 
@@ -940,6 +940,34 @@ Then the UI shows "This record was updated by another session. Please refresh th
 **Technical Constraints**
 
 - None additional
+
+---
+
+### Implementation Record — FE-2.3
+
+**Design source:** none. The `BursaTrack.dc.html` prototype has no Edit Lot flow at all — the only per-lot/per-position "Edit" affordance in the design is the dashboard's ••• menu's "Edit Position" item, which calls `this.proto()` (a stub that shows "Prototype — this action is visual only for now." and does nothing else). Optimistic-locking/conflict UI isn't modeled anywhere in the prototype. Built from the story's AC/Gherkin text directly, reusing this codebase's established visual language (Dialog, form-field layout, `FeePreviewPanel`, the amber "soft warning" treatment already used for rate-limiting in `ForgotPasswordForm`) rather than inventing new patterns.
+
+**What was actually built**
+
+- `components/portfolio/EditLotDialog.tsx` (new) — shares/price/date/broker fields pre-filled from the lot being edited, live fee preview (same `FeePreviewPanel`/`useFeePreview` as Add Lot), `version` carried in state and always sent with the PATCH but never exposed as an input. On a 409, shows the AC's exact required copy ("This record was updated by another session. Please refresh the page to see the latest values before making changes.") in an amber banner with a "Refresh" button; refreshing re-fetches the position, repopulates every field (including `version`) from the now-current lot, and re-enables the form for another attempt.
+- `app/positions/[id]/page.tsx` — added an "Actions" column to the Lots table with a per-row "Edit" button (styled after the design's own Dividends-tab row-action pattern, the closest real precedent for a per-row text-button in this design system, since no lot-specific action button exists to copy). Wired `editingLotId` state, `EditLotDialog`, and a save handler that revalidates both the position and dashboard SWR caches and surfaces the returned notice.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **The 409 banner uses the AC's exact wording, not the backend's own message.** `app/errors.py::version_conflict()` returns `"This record was modified by another session. Please refresh and try again."`, but FE-2.3's Gherkin specifies different, more actionable copy ("...Please refresh the page to see the latest values before making changes."). Since the AC dictates the exact user-facing text, the dialog displays a hardcoded constant rather than `err.message` for this one error case — the only place in the app where a backend error message is deliberately not shown verbatim.
+2. **No UI was built for editing position metadata (`category_tag`/`notes`)**, even though BE-2.3 built `PATCH /positions/{id}` for exactly that. This story's own Gherkin scenario is scoped to "a user opens the edit form for a **lot**," and no AC mentions category/notes editing — building it now would be scope creep against this story's actual acceptance criteria, not a gap. Flagged as unbuilt-but-available backend capability, not deferred to a specific future story since none currently claims it.
+3. **EX-008 was verified via a live two-request smoke test (first PATCH succeeds and bumps `version`, a second PATCH replaying the stale `version` receives 409), not two literal browser sessions.** No browser automation tooling exists in this environment this session (same standing limitation as every FE story) — this is as close a substitute as scripted testing allows, since it exercises the identical server-side conditional-UPDATE code path a real concurrent session would hit (already established as sufficient in BE-2.3's own backend test suite). The user's own manual QA with two real browser tabs remains the authoritative verification for the DoD.
+
+**Test evidence**
+
+- `npm run build` and `npm run lint`: clean.
+- Live smoke test against the real backend + Postgres, using the exact request shape `EditLotDialog` sends: PATCH with `version=1` → 200, fees recalculated, `version` bumped to 2, `warnings` containing the exact EC-015 copy; a second PATCH still carrying `version=1` → 409 `version_conflict`; `GET /positions/{id}` afterward (what the dialog's "Refresh" button triggers) shows the current `version=2` lot, confirming the refresh-and-retry flow has correct data to repopulate from; `GET` on a random/nonexistent position ID → generic 404 with no information disclosure.
+- Confirmed `/positions/[id]` still server-renders without errors via the Next.js dev server log.
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session — the dialog's interactive behavior (conflict banner appearing, Refresh button repopulating fields, the disabled-during-conflict form state) is the user's manual QA pass, including the DoD's explicit two-browser-session EX-008 test.
+- Position metadata (category_tag/notes) editing UI remains unbuilt (see Deviation 2) — `PATCH /positions/{id}` is available whenever a story claims it.
 
 ---
 

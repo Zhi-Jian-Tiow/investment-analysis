@@ -7,6 +7,7 @@ import { Suspense, useState } from "react";
 
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AddLotDialog } from "@/components/portfolio/AddLotDialog";
+import { EditLotDialog } from "@/components/portfolio/EditLotDialog";
 import { useBrokers } from "@/hooks/useBrokers";
 import { useDashboard } from "@/hooks/useDashboard";
 import { usePosition } from "@/hooks/usePosition";
@@ -35,6 +36,7 @@ function PositionDetailContent() {
   const { brokers } = useBrokers();
   const { mutate: revalidateDashboard } = useDashboard();
   const [addLotOpen, setAddLotOpen] = useState(false);
+  const [editingLotId, setEditingLotId] = useState<string | null>(null);
 
   const [notice, setNotice] = useState<string | null>(searchParams.get("notice"));
 
@@ -47,6 +49,14 @@ function PositionDetailContent() {
     await revalidateDashboard();
     setNotice(lotNotice);
   }
+
+  async function handleLotEdited(lotNotice: string) {
+    await revalidatePosition();
+    await revalidateDashboard();
+    setNotice(lotNotice);
+  }
+
+  const editingLot = position?.lots.find((l) => l.id === editingLotId) ?? null;
 
   return (
     <div className="min-h-screen bg-background">
@@ -165,7 +175,7 @@ function PositionDetailContent() {
             </div>
             <div className="rounded-xl border border-border bg-card">
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[980px] border-collapse text-[13.5px]">
+                <table className="w-full min-w-[1060px] border-collapse text-[13.5px]">
                   <thead>
                     <tr className="border-b border-border">
                       <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
@@ -198,6 +208,9 @@ function PositionDetailContent() {
                       <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         All-In Cost
                       </th>
+                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                        Actions
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
@@ -224,6 +237,15 @@ function PositionDetailContent() {
                             {formatMoney(lot.stamp_duty)}
                           </td>
                           <td className="px-3.5 py-3 text-right font-bold">{formatMoney(lot.all_in_cost)}</td>
+                          <td className="px-3.5 py-3 text-right whitespace-nowrap">
+                            <button
+                              type="button"
+                              onClick={() => setEditingLotId(lot.id)}
+                              className="cursor-pointer rounded-[5px] px-1.5 py-1 text-[12.5px] font-semibold text-primary hover:bg-accent"
+                            >
+                              Edit
+                            </button>
+                          </td>
                         </tr>
                       );
                     })}
@@ -241,6 +263,18 @@ function PositionDetailContent() {
 
       {position && (
         <AddLotDialog open={addLotOpen} onOpenChange={setAddLotOpen} position={position} onLotAdded={handleLotAdded} />
+      )}
+      {position && editingLot && (
+        <EditLotDialog
+          open={Boolean(editingLotId)}
+          onOpenChange={(next) => {
+            if (!next) setEditingLotId(null);
+          }}
+          position={position}
+          lot={editingLot}
+          revalidatePosition={revalidatePosition}
+          onSaved={handleLotEdited}
+        />
       )}
     </div>
   );
