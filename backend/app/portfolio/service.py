@@ -116,6 +116,46 @@ async def get_position_lots(db: AsyncSession, position_id: uuid.UUID) -> list[Lo
     return list(result.scalars().all())
 
 
+async def list_positions_for_dashboard(
+    db: AsyncSession, portfolio_id: uuid.UUID
+) -> list[tuple[Position, list[Lot], list[DividendTranche]]]:
+    """BE-4.1: the dashboard's own batched read. Calling get_position_lots/
+    get_position_dividend_tranches once per position (FE-2.1's original
+    minimal slice) is an N+1 pattern — 2 queries per position, which would
+    blow the <3s/50-position NFR. This does exactly 3 queries total
+    regardless of position count, backed by ix_lots_position_id_is_deleted
+    and ix_dividend_tranches_position_id_year_is_deleted (architecture §8.3).
+    """
+    positions = await list_positions_for_portfolio(db, portfolio_id)
+    if not positions:
+        return []
+
+    position_ids = [p.id for p in positions]
+
+    lots_result = await db.execute(
+        select(Lot)
+        .where(Lot.position_id.in_(position_ids), Lot.is_deleted.is_(False))
+        .order_by(Lot.purchase_date, Lot.created_at)
+    )
+    lots_by_position: dict[uuid.UUID, list[Lot]] = {}
+    for lot in lots_result.scalars().all():
+        lots_by_position.setdefault(lot.position_id, []).append(lot)
+
+    tranches_result = await db.execute(
+        select(DividendTranche).where(
+            DividendTranche.position_id.in_(position_ids), DividendTranche.is_deleted.is_(False)
+        )
+    )
+    tranches_by_position: dict[uuid.UUID, list[DividendTranche]] = {}
+    for tranche in tranches_result.scalars().all():
+        tranches_by_position.setdefault(tranche.position_id, []).append(tranche)
+
+    return [
+        (position, lots_by_position.get(position.id, []), tranches_by_position.get(position.id, []))
+        for position in positions
+    ]
+
+
 def position_aggregates(lots: list[Lot]) -> tuple[int, Decimal, Decimal]:
     """BR-010 (total_shares) / BR-011 (total_all_in_cost), plus the blended
     purchase price derived from them. Computed at query time, never stored

@@ -12,6 +12,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -108,6 +109,9 @@ class Lot(Base):
         CheckConstraint("clearing_fee >= 0", name="lots_clearing_fee_nonneg"),
         CheckConstraint("stamp_duty >= 0", name="lots_stamp_duty_nonneg"),
         CheckConstraint("all_in_cost > 0", name="lots_all_in_cost_positive"),
+        # Architecture §8.3: "dashboard aggregate queries" — BE-4.1's batched
+        # per-position lot fetch filters on exactly this pair.
+        Index("ix_lots_position_id_is_deleted", "position_id", "is_deleted"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -154,6 +158,11 @@ class DividendTranche(Base):
         CheckConstraint("qualifying_shares >= 1", name="dividend_tranches_qualifying_shares_positive"),
         CheckConstraint("total_amount > 0", name="dividend_tranches_total_amount_positive"),
         CheckConstraint("year >= 1990 AND year <= 2100", name="dividend_tranches_year_range"),
+        # Architecture §8.3: "YTD dividend sum" — BE-4.1's batched per-position
+        # tranche fetch filters on position_id/is_deleted; year is included to
+        # match the architecture doc's exact composite (also serves BE-3.3's
+        # own year-scoped calendar query).
+        Index("ix_dividend_tranches_position_id_year_is_deleted", "position_id", "year", "is_deleted"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)

@@ -41,7 +41,7 @@ from app.portfolio.service import (
     get_position_dividend_tranches,
     get_position_lots,
     list_brokers,
-    list_positions_for_portfolio,
+    list_positions_for_dashboard,
     position_aggregates,
     position_dividend_income_ytd,
     update_dividend_tranche,
@@ -102,21 +102,30 @@ async def get_dashboard(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> PortfolioResponse:
-    """A minimal slice of the Epic 4 (BE-4.1) dashboard endpoint, pulled
-    forward for FE-2.1: it's the only spec-documented way to list a user's
-    positions. Dividend income is real as of BE-3.1; price-refresh fields
-    stay at their documented-nullable/zero defaults until the price-feed
-    epic exists.
+    """BE-4.1. `dividend_yield` from this story's AC is deliberately not on
+    PositionSummaryResponse/PortfolioResponse — the OpenAPI spec's own
+    PortfolioResponse description is explicit that yield is "intentionally
+    absent" and always computed client-side (P0-API-001/FC-002), and the DB
+    schema review (FC-005) confirms no yield column/view exists anywhere.
+    Same architecture call already made for FE-3.1's per-position yield. All
+    other per-position fields match BAS §7's derived-aggregates table.
+
+    current_price/price_source/price_last_refreshed_at/current_market_value/
+    unrealised_pnl and the portfolio-level last_price_refresh_at stay at
+    their documented-nullable defaults (BAS EC-005) until the price-feed
+    epic (Epic 5) exists.
+
+    Uses list_positions_for_dashboard's batched read (3 queries total) rather
+    than querying lots/tranches once per position — see that function's
+    docstring for the NFR reasoning.
     """
     portfolio = await get_portfolio_for_user(db, current_user.id)
-    positions = await list_positions_for_portfolio(db, portfolio.id)
+    rows = await list_positions_for_dashboard(db, portfolio.id)
 
     summaries: list[PositionSummaryResponse] = []
     total_all_in_cost = Decimal("0.00")
     total_dividend_income_ytd = Decimal("0.00")
-    for position in positions:
-        lots = await get_position_lots(db, position.id)
-        tranches = await get_position_dividend_tranches(db, position.id)
+    for position, lots, tranches in rows:
         total_shares, position_all_in_cost, blended_purchase_price = position_aggregates(lots)
         position_income_ytd = position_dividend_income_ytd(tranches)
         total_all_in_cost += position_all_in_cost

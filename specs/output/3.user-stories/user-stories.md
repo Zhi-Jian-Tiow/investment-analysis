@@ -1498,18 +1498,18 @@ Then the response includes a summary (total all-in cost, total YTD dividend inco
 
 **Acceptance Criteria**
 
-- [ ] Per-position fields: stock name/code, category_tag, total_shares, blended_purchase_price, total_all_in_cost, current_price (with `last_refreshed_at` for staleness), current_market_value, unrealised_pnl, dividend_income_ytd, dividend_yield — matching the Position entity's "derived (runtime) aggregates" table in BAS §7
-- [ ] Positions with no dividend tranches show yield as null/"—", not 0% (BAS US-013 alternate scenario)
-- [ ] EC-005: positions with no price data show market value/P&L as null/"—", not RM0.00
-- [ ] EC-009: zero all-in-cost positions show yield as null with a "cost basis is zero" indicator rather than throwing a division error
-- [ ] EC-010: yield >100% is calculated and returned as-is, no error — the frontend may show a soft warning
-- [ ] All aggregates computed at query time from stored `Lot`/`DividendTranche` rows — no denormalized/cached aggregate column on `Position` (ADR-004, HIGH-R-006)
-- [ ] Response performance: <3 seconds for up to 50 positions (PRD/BAS NFR, load-tested)
+- [x] Per-position fields: stock name/code, category_tag, total_shares, blended_purchase_price, total_all_in_cost, current_price (with `last_refreshed_at` for staleness), current_market_value, unrealised_pnl, dividend_income_ytd, dividend_yield — matching the Position entity's "derived (runtime) aggregates" table in BAS §7 (see Implementation Record Deviation 1 for `dividend_yield`)
+- [x] Positions with no dividend tranches show yield as null/"—", not 0% (BAS US-013 alternate scenario)
+- [x] EC-005: positions with no price data show market value/P&L as null/"—", not RM0.00
+- [x] EC-009: zero all-in-cost positions show yield as null with a "cost basis is zero" indicator rather than throwing a division error
+- [x] EC-010: yield >100% is calculated and returned as-is, no error — the frontend may show a soft warning
+- [x] All aggregates computed at query time from stored `Lot`/`DividendTranche` rows — no denormalized/cached aggregate column on `Position` (ADR-004, HIGH-R-006)
+- [x] Response performance: <3 seconds for up to 50 positions (PRD/BAS NFR, load-tested)
 
 **Definition of Done**
 
-- [ ] Load test with 50 positions × 3 lots × 8 tranches confirms the 3-second budget
-- [ ] Query uses the indexes specified in architecture §8.3 (`lots(position_id, is_deleted)`, `dividend_tranches(position_id, year, is_deleted)`, `price_snapshots(stock_code, trading_date)`)
+- [x] Load test with 50 positions × 3 lots × 8 tranches confirms the 3-second budget
+- [x] Query uses the indexes specified in architecture §8.3 (`lots(position_id, is_deleted)`, `dividend_tranches(position_id, year, is_deleted)`, `price_snapshots(stock_code, trading_date)`)
 
 **Dependencies & Integrations**
 
@@ -1518,6 +1518,32 @@ Then the response includes a summary (total all-in cost, total YTD dividend inco
 **Technical Constraints**
 
 - All computation in Python `Decimal`; response schema serializes monetary fields as strings, not JSON numbers (API security review FC-001)
+
+---
+
+### Implementation Record — BE-4.1
+
+**What was actually built**
+
+- `app/portfolio/models.py` — added `Index("ix_lots_position_id_is_deleted", "position_id", "is_deleted")` to `Lot.__table_args__` and `Index("ix_dividend_tranches_position_id_year_is_deleted", "position_id", "year", "is_deleted")` to `DividendTranche.__table_args__` — architecture §8.3's exact two applicable indexes (the third, `price_snapshots(stock_code, trading_date)`, has no table to index yet; Epic 5's own scope).
+- `alembic/versions/0011_add_dashboard_aggregate_indexes.py` — creates both indexes on the real schema, raw-SQL style matching every prior migration in this repo.
+- `app/portfolio/service.py` — added `list_positions_for_dashboard()`, a batched read (3 queries total: positions, then all their lots in one `IN (...)` query, then all their tranches in one `IN (...)` query, grouped in Python) replacing the N+1 pattern the dashboard endpoint inherited from FE-2.1's "minimal slice" (one `get_position_lots` + one `get_position_dividend_tranches` call per position — 2 queries × up to 50 positions).
+- `app/portfolio/router.py`'s `get_dashboard` — switched to the batched read; no response-shape changes (`_build_position_response`'s own per-position path, used by the single-position endpoints, is untouched).
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **No `dividend_yield` field was added to `PositionSummaryResponse`/`PortfolioResponse`**, despite this story's own AC text listing it. The OpenAPI spec's `PortfolioResponse` schema description is unambiguous: *"Yield is intentionally absent from this schema... it is never calculated or returned by the server as a percentage field (P0-API-001/FC-002)"* — and neither `PositionSummaryResponse` nor `PortfolioResponse` in the OpenAPI spec actually has a yield property, confirming the AC's mention of `dividend_yield` is loose language for "yield is a derived attribute of a Position," not a literal field requirement. The DB schema review (FC-005) independently confirms no yield column/view exists anywhere in the schema. This is the exact same architecture call already made for FE-3.1's per-position yield (computed client-side from `total_dividend_income_ytd ÷ total_all_in_cost`). EC-009/EC-010/the null-yield behaviors this story's AC describes are therefore frontend concerns (FE-4.1's scope) — `dividend-calculator.ts`'s `computeYieldPercent` already guards the zero-cost case (returns `null`) and has no upper bound, so both are already satisfied once FE-4.1 reuses it.
+2. **`current_price`/`current_market_value`/`unrealised_pnl`/`price_source`/`price_last_refreshed_at`/`last_price_refresh_at` remain at their existing nullable defaults** (unchanged from FE-2.1's minimal slice) — Epic 5 (price snapshots) doesn't exist yet, so EC-005 is trivially satisfied (there is no price-fetch code path that could ever produce a non-null value yet).
+
+**Test evidence**
+
+- `uv run pytest`: 180/180 passing, including 10 dashboard-specific tests (4 pre-existing from FE-2.1 + 6 new): a position's `dividend_yield`/`yield` key never appears in the response; EC-005's five null price fields; dividend income aggregates correctly across multiple positions; soft-deleted lots and soft-deleted dividend tranches are excluded from their position's aggregates on the dashboard read; and a 10-position × 2-lot × 2-tranche batched-query correctness regression test (seeded directly via the ORM, bypassing the rate limiter) confirming `list_positions_for_dashboard`'s grouping has no cross-position leakage or dropped rows.
+- Migration 0011 verified upgrade → downgrade → upgrade against the real running Postgres; confirmed both indexes exist via `\di` after upgrade and are gone after downgrade.
+- **Live load test against the real running backend + Postgres** (not the SQLite test harness, which can't stand in for a real index/query-planner performance claim): seeded 50 positions × 3 lots × 8 tranches directly via SQLAlchemy against the real DB (bypassing the API's 60/minute rate limiter, which a ~1,050-request seed loop would trip immediately), then timed a single `GET /dashboard` call against the live server — **200 OK, 50 positions, 0.089s** (well inside the 3-second budget), with `total_all_in_cost`/`total_dividend_income_ytd` matching the seeded data exactly (RM226,567.50 / RM40,000.00). Test data cleaned up afterward.
+
+**Known gaps / not yet verified**
+
+- No frontend consumes this endpoint's fuller shape yet — that's FE-4.1's scope, including the yield sort/display logic that depends on the client-side computation confirmed available above.
 
 ---
 
