@@ -1,6 +1,5 @@
-"""broker_configs, portfolios, positions, lots (BursaTrack-DB-Stage3-Physical-Schema.md
-§3.4-3.7). dividend_tranches (§3.8) belongs to Epic 3 and is added when those
-stories are implemented.
+"""broker_configs, portfolios, positions, lots, dividend_tranches
+(BursaTrack-DB-Stage3-Physical-Schema.md §3.4-3.8).
 """
 
 import uuid
@@ -126,6 +125,48 @@ class Lot(Base):
     broker_config_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("broker_configs.id", ondelete="RESTRICT"), nullable=False
     )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DividendTranche(Base):
+    """P0 INVARIANT (BR-009/BR-027): total_amount is stored at logging time as
+    per_share_amount x qualifying_shares. It must NEVER be recomputed from the
+    current position share count — this is the one field in the schema that
+    deliberately breaks the "derive everything at query time" pattern every
+    other aggregate follows (architecture ADR-004). Only an explicit edit to
+    this row (BE-3.2) may change total_amount. Do not "fix" this into a
+    derived/computed column.
+    """
+
+    __tablename__ = "dividend_tranches"
+    __table_args__ = (
+        CheckConstraint(
+            "tranche_label IN ('1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th')",
+            name="dividend_tranches_label_check",
+        ),
+        CheckConstraint("per_share_amount > 0", name="dividend_tranches_per_share_positive"),
+        CheckConstraint("qualifying_shares >= 1", name="dividend_tranches_qualifying_shares_positive"),
+        CheckConstraint("total_amount > 0", name="dividend_tranches_total_amount_positive"),
+        CheckConstraint("year >= 1990 AND year <= 2100", name="dividend_tranches_year_range"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    position_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("positions.id", ondelete="RESTRICT"), nullable=False
+    )
+    tranche_label: Mapped[str] = mapped_column(String, nullable=False)
+    per_share_amount: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    qualifying_shares: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    ex_dividend_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

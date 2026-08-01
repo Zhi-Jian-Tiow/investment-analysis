@@ -1,14 +1,15 @@
-"""Broker-list schemas (FE-1.1) plus Position/Lot create-and-response schemas
-(BE-2.1, BE-2.2). DividendTranche schemas belong to Epic 3 (BE-3.x).
+"""Broker-list schemas (FE-1.1) plus Position/Lot/DividendTranche
+create-and-response schemas (BE-2.x, BE-3.1).
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _CATEGORY_TAGS = ("Dividend", "Volatile", "Growth")
+_TRANCHE_LABELS = ("1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th")
 
 
 def _check_shares(value: int) -> int:
@@ -207,6 +208,77 @@ class LotResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class CreateDividendRequest(BaseModel):
+    """Matches components/schemas/CreateDividendRequest in
+    03-openapi-specification.md. `year` is not a client input — it's always
+    derived from `payment_date` (VR-012: "Default: YEAR(payment_date);
+    editable" describes the field's semantics generally, but this endpoint's
+    schema has no year field at all, so there is nothing to override at
+    creation time).
+    """
+
+    position_id: UUID
+    tranche_label: str
+    per_share_amount: Decimal
+    qualifying_shares: int = Field(..., ge=1)
+    payment_date: date
+    ex_dividend_date: date | None = None
+
+    @field_validator("tranche_label")
+    @classmethod
+    def validate_tranche_label(cls, value: str) -> str:
+        if value not in _TRANCHE_LABELS:
+            raise ValueError(f"tranche_label must be one of {_TRANCHE_LABELS}")
+        return value
+
+    @field_validator("per_share_amount")
+    @classmethod
+    def validate_per_share_amount(cls, value: Decimal) -> Decimal:
+        # VR-008
+        if value <= 0:
+            raise ValueError("Dividend per share must be greater than zero")
+        exponent = value.as_tuple().exponent
+        if isinstance(exponent, int) and exponent < -6:
+            raise ValueError("Dividend per share can have at most 6 decimal places")
+        return value
+
+    @field_validator("payment_date")
+    @classmethod
+    def validate_payment_date(cls, value: date) -> date:
+        # VR-009
+        if value > date.today() + timedelta(days=30):
+            raise ValueError("Payment date cannot be more than 30 days in the future")
+        return value
+
+    @model_validator(mode="after")
+    def validate_ex_dividend_date(self) -> "CreateDividendRequest":
+        # VR-010
+        if self.ex_dividend_date is not None and self.ex_dividend_date > self.payment_date:
+            raise ValueError("Ex-dividend date must be before or on the payment date")
+        return self
+
+
+class DividendTrancheResponse(BaseModel):
+    """Matches components/schemas/DividendTrancheResponse in
+    03-openapi-specification.md.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    position_id: UUID
+    tranche_label: str
+    per_share_amount: Decimal
+    qualifying_shares: int
+    total_amount: Decimal
+    payment_date: date
+    ex_dividend_date: date | None = None
+    year: int
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
 class PositionSummaryResponse(BaseModel):
     """Matches components/schemas/PositionSummaryResponse in
     03-openapi-specification.md — the list-row shape used by
@@ -251,10 +323,9 @@ class PortfolioResponse(BaseModel):
 
 class PositionResponse(BaseModel):
     """Matches components/schemas/PositionResponse (via PositionSummaryResponse)
-    in 03-openapi-specification.md, with fields that depend on later epics
-    left at their documented-nullable defaults:
-    - dividend_tranches: always [] until Epic 3 exists
-    - total_dividend_income_ytd: always "0.00" until Epic 3
+    in 03-openapi-specification.md. `dividend_tranches`/`total_dividend_income_ytd`
+    are real as of BE-3.1. Fields that still depend on the unbuilt price-feed
+    epic are left at their documented-nullable defaults:
     - current_price/price_source/price_last_refreshed_at/current_market_value/
       unrealised_pnl: always null until the price-feed epic exists (all
       nullable in the spec for exactly this "no price ever retrieved" case,
@@ -286,7 +357,7 @@ class PositionResponse(BaseModel):
     current_market_value: Decimal | None = None
     unrealised_pnl: Decimal | None = None
     lots: list[LotResponse]
-    dividend_tranches: list[dict] = Field(default_factory=list)
+    dividend_tranches: list[DividendTrancheResponse] = Field(default_factory=list)
     is_deleted: bool
     created_at: datetime
     updated_at: datetime

@@ -1099,21 +1099,21 @@ Then the server stores qualifying_shares and computes total_amount = per_share_a
 
 **Acceptance Criteria**
 
-- [ ] `qualifying_shares` defaults to current `position_total_shares` at logging time but is user-overridable, bounded `1 ≤ qualifying_shares ≤ position_total_shares` at time of entry (VR-011)
-- [ ] `total_amount = per_share_amount × qualifying_shares`, rounded to 2dp (BR-025), is a **stored** column — never a computed/derived value at read time (BR-009, architecture §12.3 explicitly rules out a stored `yield_percentage` but `total_amount` on `DividendTranche` IS stored deliberately, per BR-009's fix)
-- [ ] **P0 regression test (mandatory, cannot be skipped per BAS §14):** logging a 1st tranche (qualifying_shares=5000, total_amount=RM1,000 stored), then adding a new 2,000-share lot, must leave the 1st tranche's `total_amount` at exactly RM1,000.00 — this is EC-022 verbatim
-- [ ] BR-014: a position may have at most 8 `DividendTranche` rows per calendar `year`; the 9th attempt is rejected with "Maximum of 8 dividend tranches per year reached for [Stock] ([Year])"
-- [ ] VR-008 (per_share_amount >0, ≤6dp), VR-009 (payment_date ≤30 days future), VR-010 (ex_dividend_date ≤ payment_date if present), VR-012 (year 1990–current+1) all enforced
-- [ ] Position yield recalculated as `SUM(DividendTranche.total_amount for year=current) / position_total_all_in_cost` (BR-008, BR-012) — using **all-in cost**, never the pre-fee initial amount
-- [ ] Portfolio blended yield = `SUM(all positions' income) / SUM(all positions' cost)` — weighted, not an arithmetic average of individual position yields (BR-013)
-- [ ] EC-023: when a user deliberately sets qualifying_shares below the current position total, the tranche detail view surfaces both numbers ("5,000 qualifying shares (current total: 7,000)") with no error — this is a valid, intentional state
-- [ ] `audit_log` entry `DIVIDEND_CREATED`
+- [x] `qualifying_shares` defaults to current `position_total_shares` at logging time but is user-overridable, bounded `1 ≤ qualifying_shares ≤ position_total_shares` at time of entry (VR-011) — the default is a frontend concern (FE-3.1); the backend enforces the upper bound server-side regardless of what the client sends
+- [x] `total_amount = per_share_amount × qualifying_shares`, rounded to 2dp (BR-025), is a **stored** column — never a computed/derived value at read time
+- [x] **P0 regression test (mandatory, cannot be skipped per BAS §14):** logging a 1st tranche (qualifying_shares=5000, total_amount=RM1,000 stored), then adding a new 2,000-share lot, leaves the 1st tranche's `total_amount` at exactly RM1,000.00 — verified both via an automated test and a live smoke test against real Postgres (see Implementation Record)
+- [x] BR-014: a position may have at most 8 `DividendTranche` rows per calendar `year`; the 9th attempt is rejected with "Maximum of 8 dividend tranches per year reached for [Stock] ([Year])"
+- [x] VR-008 (per_share_amount >0, ≤6dp), VR-009 (payment_date ≤30 days future), VR-010 (ex_dividend_date ≤ payment_date if present) enforced. VR-012 (year 1990–current+1) is enforced as a DB CHECK constraint only — `year` is never a client input (see Implementation Record Deviation 1), so there's no request field to validate it against.
+- [x] Position yield is **not** returned as a percentage by the server at all (architecture's own documented decision, `PortfolioResponse`'s P0-API-001/FC-002 note: yield is always computed client-side via decimal.js). The backend's job is to return the correct ingredients — `total_dividend_income_ytd` and `total_all_in_cost` — so a correct client-side calculation is possible; verified this explicitly with a negative-assertion test (see DoD below).
+- [x] Portfolio blended yield: same as above — the backend returns `total_dividend_income_ytd` and `total_all_in_cost` as weighted sums across all positions (not per-position averages), which is what a correct client-side BR-013 calculation requires.
+- [x] EC-023: qualifying_shares below the current position total is accepted with no error (verified); the tranche response includes both `qualifying_shares` and the position's own `total_shares` is already visible on the same `GET /positions/{id}` call, so a frontend can surface both without any extra backend work — actually building that UI surfacing is FE-3.1 scope, not this story's.
+- [x] `audit_log` entry `DIVIDEND_CREATED`
 
 **Definition of Done**
 
-- [ ] Unit test: `total_amount` is stored and provably immutable across a subsequent lot-add operation (cross-references BE-2.2's invariant test — these two tests should assert the same fact from both directions)
-- [ ] Unit test: yield calculation uses all-in cost, with the explicit negative assertion that it does NOT equal `income / pre_fee_initial_amount` (BAS US-011)
-- [ ] Code review checklist item: any PR touching `DividendTranche.total_amount` must be explicitly reviewed against BR-009/BR-027 (architecture P-004)
+- [x] Unit test: `total_amount` is stored and provably immutable across a subsequent lot-add operation — extends BE-2.2's precursor test from the other direction, exactly as the DoD asked ("these two tests should assert the same fact from both directions"); also extended BE-2.3's EC-015 precursor the same way for lot *edits*.
+- [x] Unit test: verifies the backend returns the correct ingredients for an all-in-cost-based yield calculation, with an explicit negative assertion that `income / all_in_cost` differs from `income / pre_fee_initial_amount` (BAS US-011) — see Implementation Record for why this is framed around the returned fields rather than a yield percentage the backend never computes.
+- [x] Code review checklist item: not enforced by tooling (no CI/review-gate infrastructure exists in this project) — the `DividendTranche` model's own docstring explicitly warns against turning `total_amount` into a derived value, serving the same purpose for a solo-founder codebase.
 
 **Dependencies & Integrations**
 
@@ -1123,6 +1123,37 @@ Then the server stores qualifying_shares and computes total_amount = per_share_a
 
 - `per_share_amount` is `NUMERIC(12,6)`; `total_amount` is `NUMERIC(14,2)` (architecture §12.3)
 - This is the one field in the entire schema where "derived at query time" (the architecture's general pattern, ADR-004) is deliberately **not** followed — the schema comment on this column must explain why, so a future engineer doesn't "fix" it into a derived value
+
+---
+
+### Implementation Record — BE-3.1
+
+**What was actually built**
+
+- `app/portfolio/models.py` — `DividendTranche` model (physical schema §3.8), with a docstring explicitly warning against ever turning `total_amount` into a derived/computed column.
+- `alembic/versions/0009_create_dividend_tranches.py` — creates `dividend_tranches`; extends `audit_log`'s CHECK constraints for `DIVIDEND_CREATED`/`DividendTranche`. Verified upgrade/downgrade both directions against real Postgres.
+- `app/portfolio/schemas.py` — `CreateDividendRequest` (VR-008/009/010 validators), `DividendTrancheResponse`. `PositionResponse.dividend_tranches` upgraded from its BE-2.1-era `list[dict]` stub to the real `list[DividendTrancheResponse]`.
+- `app/portfolio/service.py` — `create_dividend_tranche` (the core P0 logic: computes and stores `total_amount` once, validates `qualifying_shares` against the position's live total-shares lookup, enforces BR-014's 8-per-year cap and the duplicate-label rule below), `get_position_dividend_tranches`, `position_dividend_income_ytd` (BR-012's YTD sum, using each tranche's own stored `year` — never re-derived from `date.today()` at read time).
+- `app/portfolio/router.py` — `POST /api/v1/portfolio/dividends` (`position_id` travels in the body, matching the OpenAPI spec's non-nested URL, unlike Lots). Also wired real dividend data into `GET /positions/{id}`, `POST /positions` (the EC-001 add-lot-redirect path), `PATCH /positions/{id}`, and `GET /dashboard` — all four previously returned the BE-2.1-era `total_dividend_income_ytd: "0.00"` / `dividend_tranches: []` placeholders; they now return real values.
+- **Extended BE-2.4's cascade delete**, as explicitly flagged in that story's own Implementation Record: `delete_position` now also soft-deletes a position's active `DividendTranche` rows, not just its Lots.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **`year` is never a client-supplied field.** `CreateDividendRequest` in the OpenAPI spec has no `year` property at all — only VR-012's general description ("Default: YEAR(payment_date); editable") suggests it might be. Since the request schema itself settles this, `year` is always `payment_date.year`, computed server-side, with no way to override it at creation. (BE-3.2's `UpdateDividendRequest` doesn't have a `year` field either, so this remains true after edits too — out of scope to revisit here.)
+2. **Rejecting a duplicate `tranche_label` within the same position+year is a judgment call, not spec-mandated.** Neither the physical schema (no UNIQUE constraint) nor any BR/VR forbids two "1st" tranches in the same year — BR-014 only caps the *count* at 8. Since `tranche_label` is a required client input (not server-auto-assigned, despite the design prototype's UI auto-suggesting the next unused label), allowing duplicates would let a user create two same-labeled, confusing entries. Rejected with a clear message, following the same "resolve an undocumented edge case explicitly, don't silently allow or silently block" pattern as BE-2.5's last-lot rule.
+3. **Yield is framed entirely around "does the backend return the right ingredients," not "is the yield percentage correct"** — because the backend never computes or returns a yield percentage at all. This was already architecture's own explicit decision (documented on `PortfolioResponse`, P0-API-001/FC-002) before this story existed; BE-3.1's AC talks about "yield recalculated" in a way that reads like the backend should compute it, but the actual, more specific architectural constraint wins. The DoD's negative-assertion test was reframed accordingly (see test evidence).
+
+**Test evidence**
+
+- `uv run pytest`: 144/144 passing (124 pre-existing + 20 new): happy-path storage, auth requirement, 404 ownership checks, qualifying_shares upper-bound rejection, EC-023 (qualifying_shares below current total is valid), VR-008/009/010 validation, BR-014's 8-per-year cap, the duplicate-label rejection, same-label-different-year allowed, `DIVIDEND_CREATED` audit log, dividend data now appearing on both `GET /positions/{id}` and `GET /dashboard`, the yield-ingredients negative-assertion test, **the full EC-022 P0 regression test** (add a lot after logging a dividend — total_amount unchanged), **the full EC-015 test** (edit a lot's shares after logging a dividend — total_amount unchanged), and confirming `delete_position`'s cascade now covers dividend tranches too.
+- Migration 0009 applied and rolled back cleanly against the real Postgres container (upgrade/downgrade/upgrade).
+- **Live smoke test reproducing the exact historical Excel defect end-to-end against real Postgres**: registered a user, created a 5,000-share position, logged a 1st dividend (5,000 qualifying shares → RM1,000.00 stored), added a 2,000-share lot, then re-fetched the position — `total_shares` correctly grew to 7,000, while the dividend's `total_amount` stayed exactly RM1,000.00. Also confirmed `GET /dashboard`'s `total_dividend_income_ytd` correctly shows RM1,000.00.
+- `npm run build` (frontend): clean — confirms the `PositionResponse.dividend_tranches` type change (from an untyped stub to real tranche objects) doesn't break the frontend's existing `unknown[]`-typed usage (no FE-3.x UI reads its internal shape yet).
+
+**Known gaps / not yet verified**
+
+- No live browser interaction (no FE-3.x work exists yet — that's FE-3.1's own story).
+- No CI/code-review-gate tooling exists in this project to mechanically enforce the DoD's "any PR touching total_amount must be reviewed against BR-009/BR-027" — the model's own docstring is the current substitute.
 
 ---
 

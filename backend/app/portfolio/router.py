@@ -9,12 +9,14 @@ from app.auth.models import User
 from app.database import get_db
 from app.rate_limit import limiter
 
-from app.portfolio.models import Lot, Position
+from app.portfolio.models import DividendTranche, Lot, Position
 from app.portfolio.schemas import (
     BrokerConfigResponse,
     BrokerListResponse,
+    CreateDividendRequest,
     CreateLotRequest,
     CreatePositionRequest,
+    DividendTrancheResponse,
     LotResponse,
     PortfolioResponse,
     PositionResponse,
@@ -24,28 +26,36 @@ from app.portfolio.schemas import (
 )
 from app.portfolio.service import (
     add_lot_to_position,
+    create_dividend_tranche,
     create_position,
     delete_lot,
     delete_position,
     get_owned_active_position,
     get_portfolio_for_user,
+    get_position_dividend_tranches,
     get_position_lots,
     list_brokers,
     list_positions_for_portfolio,
     position_aggregates,
+    position_dividend_income_ytd,
     update_lot,
     update_position_metadata,
 )
 
-# Dividend/Dashboard/Sell-Calculator routes belong to Epics 3-4. Position/Lot
-# creation is added in BE-2.1/BE-2.2; edit (this file) in BE-2.3; delete in BE-2.4.
+# Dashboard/Sell-Calculator routes belong to Epic 4. Position/Lot creation is
+# added in BE-2.1/BE-2.2; edit in BE-2.3; delete in BE-2.4; dividend logging
+# (this file) in BE-3.1.
 router = APIRouter(prefix="/api/v1", tags=["Portfolio"])
 
 
 def _build_position_response(
-    position: Position, lots: list[Lot], warnings: list[str] | None = None
+    position: Position,
+    lots: list[Lot],
+    tranches: list[DividendTranche] | None = None,
+    warnings: list[str] | None = None,
 ) -> PositionResponse:
     total_shares, total_all_in_cost, blended_purchase_price = position_aggregates(lots)
+    tranches = tranches or []
     return PositionResponse(
         id=position.id,
         stock_code=position.stock_code,
@@ -55,7 +65,9 @@ def _build_position_response(
         total_shares=total_shares,
         total_all_in_cost=total_all_in_cost,
         blended_purchase_price=blended_purchase_price,
+        total_dividend_income_ytd=position_dividend_income_ytd(tranches),
         lots=[LotResponse.model_validate(lot) for lot in lots],
+        dividend_tranches=[DividendTrancheResponse.model_validate(t) for t in tranches],
         is_deleted=position.is_deleted,
         created_at=position.created_at,
         updated_at=position.updated_at,
@@ -85,18 +97,23 @@ async def get_dashboard(
 ) -> PortfolioResponse:
     """A minimal slice of the Epic 4 (BE-4.1) dashboard endpoint, pulled
     forward for FE-2.1: it's the only spec-documented way to list a user's
-    positions. Dividend income and price-refresh fields stay at their
-    documented-nullable/zero defaults until Epic 3/the price-feed epic exist.
+    positions. Dividend income is real as of BE-3.1; price-refresh fields
+    stay at their documented-nullable/zero defaults until the price-feed
+    epic exists.
     """
     portfolio = await get_portfolio_for_user(db, current_user.id)
     positions = await list_positions_for_portfolio(db, portfolio.id)
 
     summaries: list[PositionSummaryResponse] = []
     total_all_in_cost = Decimal("0.00")
+    total_dividend_income_ytd = Decimal("0.00")
     for position in positions:
         lots = await get_position_lots(db, position.id)
+        tranches = await get_position_dividend_tranches(db, position.id)
         total_shares, position_all_in_cost, blended_purchase_price = position_aggregates(lots)
+        position_income_ytd = position_dividend_income_ytd(tranches)
         total_all_in_cost += position_all_in_cost
+        total_dividend_income_ytd += position_income_ytd
         summaries.append(
             PositionSummaryResponse(
                 id=position.id,
@@ -106,10 +123,15 @@ async def get_dashboard(
                 total_shares=total_shares,
                 total_all_in_cost=position_all_in_cost,
                 blended_purchase_price=blended_purchase_price,
+                total_dividend_income_ytd=position_income_ytd,
             )
         )
 
-    return PortfolioResponse(total_all_in_cost=total_all_in_cost, positions=summaries)
+    return PortfolioResponse(
+        total_all_in_cost=total_all_in_cost,
+        total_dividend_income_ytd=total_dividend_income_ytd,
+        positions=summaries,
+    )
 
 
 @router.post(
@@ -128,8 +150,9 @@ async def add_position(
     position, lots, warnings = await create_position(
         db, current_user.id, portfolio.id, body
     )
+    tranches = await get_position_dividend_tranches(db, position.id)
 
-    return _build_position_response(position, lots, warnings)
+    return _build_position_response(position, lots, tranches, warnings)
 
 
 @router.post(
@@ -184,8 +207,9 @@ async def get_position(
     portfolio = await get_portfolio_for_user(db, current_user.id)
     position = await get_owned_active_position(db, portfolio.id, position_id)
     lots = await get_position_lots(db, position.id)
+    tranches = await get_position_dividend_tranches(db, position.id)
 
-    return _build_position_response(position, lots)
+    return _build_position_response(position, lots, tranches)
 
 
 @router.patch("/portfolio/positions/{position_id}", response_model=PositionResponse)
@@ -202,8 +226,9 @@ async def patch_position(
         db, current_user.id, portfolio.id, position_id, body
     )
     lots = await get_position_lots(db, position.id)
+    tranches = await get_position_dividend_tranches(db, position.id)
 
-    return _build_position_response(position, lots)
+    return _build_position_response(position, lots, tranches)
 
 
 @router.patch(
@@ -243,3 +268,16 @@ async def delete_lot_endpoint(
     """
     portfolio = await get_portfolio_for_user(db, current_user.id)
     await delete_lot(db, current_user.id, portfolio.id, position_id, lot_id)
+
+
+@router.post("/portfolio/dividends", response_model=DividendTrancheResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("60/minute")
+async def add_dividend(
+    request: Request,
+    body: CreateDividendRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DividendTrancheResponse:
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    tranche = await create_dividend_tranche(db, current_user.id, portfolio.id, body)
+    return DividendTrancheResponse.model_validate(tranche)

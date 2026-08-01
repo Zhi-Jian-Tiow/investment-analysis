@@ -24,9 +24,10 @@ AUDIT_LOG_ACTIONS = (
     "LOT_DELETED",
     "POSITION_UPDATED",
     "POSITION_DELETED",
+    "DIVIDEND_CREATED",
 )
 
-AUDIT_LOG_ENTITY_TYPES = ("User", "Lot", "Position")
+AUDIT_LOG_ENTITY_TYPES = ("User", "Lot", "Position", "DividendTranche")
 
 
 def _sql_in_list(values: tuple[str, ...]) -> str:
