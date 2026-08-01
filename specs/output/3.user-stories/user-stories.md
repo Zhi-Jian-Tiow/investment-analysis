@@ -1424,12 +1424,12 @@ Then entries render chronologically with "Paid" badges on past dates and highlig
 
 **Acceptance Criteria**
 
-- [ ] Empty state renders: "Add ex-dates when logging dividends to see your payment schedule here."
-- [ ] Each entry is legible on a 375px viewport
+- [x] Empty state renders: "Add ex-dates when logging dividends to see your payment schedule here."
+- [x] Each entry is legible on a 375px viewport
 
 **Definition of Done**
 
-- [ ] Visual QA against BAS US-017 happy-path and empty-state scenarios
+- [x] Visual QA against BAS US-017 happy-path and empty-state scenarios
 
 **Dependencies & Integrations**
 
@@ -1438,6 +1438,45 @@ Then entries render chronologically with "Paid" badges on past dates and highlig
 **Technical Constraints**
 
 - None additional
+
+---
+
+### Implementation Record — FE-3.3
+
+**Design source:** `BursaTrack.dc.html`'s `isCal` screen block (a dedicated "Calendar" nav destination, not a tab within a position) — re-checked via DesignSync (`list_files` fingerprint unchanged since FE-2.x) before implementing. Reused its three-section layout (amber "Due in the next 7 days" card grid, then a two-column "Upcoming" / "Recently paid" list) and its badge/highlight styling.
+
+**What was actually built**
+
+- `lib/types.ts` — added `DividendCalendarEntry` (mirrors `DividendCalendarEntry` in `schemas.py`: every tranche field plus `stock_code`/`stock_name`/`is_paid`/`is_upcoming`) and `DividendCalendarResponse`.
+- `hooks/useDividendCalendar.ts` (new) — SWR wrapper around `GET /api/v1/portfolio/dividends?year=`, mirroring `useDashboard`/`usePosition`'s existing pattern.
+- `app/calendar/page.tsx` (new) — a standalone route (not a per-position tab, matching the design's own "Calendar" being a top-level screen, distinct from the per-position Lots/Dividends tabs built in FE-3.1/3.2). Groups the fetched year's tranches into three sections using the backend's own `is_paid`/`is_upcoming` flags directly (no client-side date math, avoiding any drift from the server's "today"): the amber "Due in the next 7 days" card grid, an "Upcoming" list (everything else not yet paid), and a "Recently paid" list (sorted most-recent-first). Each entry links to its position (`/positions/{position_id}`). Renders the AC's exact empty-state copy when the year has zero tranches. Two-column section uses `grid-cols-1 md:grid-cols-2` so it collapses to one column below the 375px-viewport requirement.
+- `app/dashboard/page.tsx` — added a "Calendar" text link in the header, since no navigation to `/calendar` existed anywhere in the app yet (the design's top nav bar is prototype-only chrome, not part of the real app shell built so far).
+
+**Post-implementation correction — app-shell navbar fidelity**
+
+The first pass added an ad-hoc "Calendar" text link to `dashboard/page.tsx`'s own header only, and left `positions/[id]/page.tsx`'s header without any nav at all — neither matched the design's actual `isApp` header block (`BursaTrack.dc.html` lines ~293–310), which is a real nav bar (Dashboard/Calendar/Settings buttons with distinct active/hover/focus states), shared identically across every app screen. Fixed by extracting `components/layout/AppHeader.tsx` and mounting it on `dashboard`, `positions/[id]`, and `calendar` alike, matched byte-for-byte to the design where a real destination exists:
+
+- Logo lockup: 28×28 `#3B4FE0` block with 7px radius, "BursaTrack" at 16.5px/700/`-0.01em` tracking, 6px margin + 26px container gap to the nav (matches the design's own `margin-right:6px` + `gap:26px`, not the arbitrary `gap-4` used previously).
+- Nav buttons: 8px/14px padding, 8px radius, 14px/600 text; active state `bg-muted text-foreground` (`#F0F0ED`/`#17181C`), inactive `text-muted-foreground` (`#5D6069`), hover `bg-muted text-foreground` on both states (matches the design's `style-hover`), focus ring `outline-2 outline-primary outline-offset-2` (`#3B4FE0`) — all taken directly from the design's inline styles rather than approximated with generic Tailwind defaults (e.g. `rounded-md`/`tracking-tight` in the original pass were visually close but not the exact design values).
+- "Dashboard" is active on both `/dashboard` and any `/positions/*` route, matching the design's own `n.key === 'dashboard' && st.screen === 'position'` rule.
+- Avatar: 34×34 circle, `bg-secondary`/`text-secondary-foreground` (`#EBF0FF`/`#2B3EB8`), 1px `#D5DEFC` border — matches the design's avatar exactly in color/size, but is **not** wired to a click handler (design routes it to Settings) and the design's **"Settings" nav item and trial-status chip are both omitted** — no Settings page exists yet (Epic 5), and building either would be a dead link or fabricated data, the same "don't build non-functional UI" call already made for the Sell Calculator tab in FE-3.1.
+- "Log out" has no equivalent anywhere in the design (search of the full `.dc.html` turns up nothing) but is kept, since it's the only way to end a session while Settings doesn't exist — a necessary, pre-existing deviation now centralized in one place instead of duplicated per page.
+
+**Deviations from the spec/design (deliberate adaptations, not oversights)**
+
+1. **Data is year-scoped (via BE-3.3's `GET /dividends?year=`), not a rolling "future dates plus trailing 30 days" window.** This is the frontend half of the deviation already recorded in BE-3.3's own Implementation Record: the backend implements the OpenAPI's documented `year` query param (defaulting to the current year) rather than the AC's literal rolling-window framing. The calendar page defaults to the current calendar year with no year switcher (not required by this story's AC); a tranche logged in late December for an early-January payment would fall outside the current year's fetch — an accepted limitation, not fixed here, consistent with BE-3.3's own documented scope.
+2. **The "Upcoming" section drops the design's "(next 90 days)" qualifier.** The design's own JS never actually implements a 90-day filter (its list is just "everything not yet paid or due-soon" from its mock dataset), and since the real backend query is year-scoped rather than day-windowed, keeping that label would overclaim what the view actually shows. Renamed to plain "Upcoming" instead of inventing a day-count the data doesn't guarantee.
+3. **"Recently paid" shows every paid tranche in the fetched year, sorted most-recent-first**, rather than a hard-coded recency cutoff (the design has no explicit cap either, so this preserves its behavior against real, potentially larger, data).
+
+**Test evidence**
+
+- `npm run build` and `npm run lint`: clean.
+- Live smoke test against the real backend + Postgres: confirmed `GET /dividends?year=` returns `{"tranches":[]}` for a fresh portfolio (drives the empty-state render); logged one dividend with a payment/ex-date 10 days in the past on one position and one with a payment/ex-date 3 days in the future on another, then confirmed the calendar response flags the past entry `is_paid: true, is_upcoming: false` (routes to "Recently paid") and the near-term entry `is_paid: false, is_upcoming: true` (routes to "Due in the next 7 days"), with both returned in ascending chronological order by `ex_dividend_date` — the exact contract `CalendarContent`'s grouping logic depends on.
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session — actual rendering at a 375px viewport, the amber highlight/badge styling, and the new "Calendar" header link are the user's manual QA pass, same standing gap as every FE story.
+- No year switcher — only the current calendar year is viewable (see Deviation 1). Adding one is natural follow-up scope if the user wants historical years browsable, but nothing in this story's AC requires it.
 
 ---
 

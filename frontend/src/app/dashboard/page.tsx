@@ -1,11 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { Suspense, useState } from "react";
 
 import { AuthGate } from "@/components/auth/AuthGate";
 import { VerifyBanner } from "@/components/dashboard/VerifyBanner";
+import { AppHeader } from "@/components/layout/AppHeader";
 import { AddPositionDialog } from "@/components/portfolio/AddPositionDialog";
 import { Button } from "@/components/ui/button";
 import { useDashboard } from "@/hooks/useDashboard";
@@ -21,37 +21,15 @@ function formatShares(value: number): string {
 }
 
 function DashboardContent() {
-  const { user, logout } = useAuth();
-  const router = useRouter();
+  const { user } = useAuth();
   const { portfolio, positions, isLoading } = useDashboard();
   const [addPositionOpen, setAddPositionOpen] = useState(false);
 
   if (!user) return null; // AuthGate guarantees this, but keeps TS happy
 
-  async function handleLogout() {
-    await logout();
-    router.push("/");
-  }
-
   return (
     <div className="min-h-screen bg-background">
-      <header className="sticky top-0 z-40 border-b border-border bg-card">
-        <div className="mx-auto flex h-[58px] max-w-[1200px] items-center gap-4 px-6">
-          <div className="flex items-center gap-2">
-            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-sm font-bold text-primary-foreground">
-              B
-            </div>
-            <div className="text-[16.5px] font-bold tracking-tight text-foreground">BursaTrack</div>
-          </div>
-          <div className="flex-1" />
-          <button type="button" onClick={handleLogout} className="cursor-pointer text-xs text-muted-foreground">
-            Log out
-          </button>
-          <div className="flex h-[34px] w-[34px] items-center justify-center rounded-full border border-[#D5DEFC] bg-secondary text-xs font-bold text-secondary-foreground">
-            {user.email.slice(0, 2).toUpperCase()}
-          </div>
-        </div>
-      </header>
+      <AppHeader />
 
       <main className="mx-auto max-w-[1200px] px-6 py-6">
         {!user.email_verified && <VerifyBanner />}

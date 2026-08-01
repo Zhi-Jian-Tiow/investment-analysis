@@ -6,6 +6,7 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 
 import { AuthGate } from "@/components/auth/AuthGate";
+import { AppHeader } from "@/components/layout/AppHeader";
 import { AddDividendDialog } from "@/components/portfolio/AddDividendDialog";
 import { AddLotDialog } from "@/components/portfolio/AddLotDialog";
 import { EditDividendDialog } from "@/components/portfolio/EditDividendDialog";
@@ -110,16 +111,7 @@ function PositionDetailContent() {
 
   return (
     <div className="min-h-screen bg-background">
-      <header className="sticky top-0 z-40 border-b border-border bg-card">
-        <div className="mx-auto flex h-[58px] max-w-[1200px] items-center gap-4 px-6">
-          <Link href="/dashboard" className="flex items-center gap-2">
-            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-sm font-bold text-primary-foreground">
-              B
-            </div>
-            <div className="text-[16.5px] font-bold tracking-tight text-foreground">BursaTrack</div>
-          </Link>
-        </div>
-      </header>
+      <AppHeader />
 
       <main className="mx-auto max-w-[1200px] px-6 py-6">
         <Link href="/dashboard" className="mb-3.5 inline-block text-[13.5px]">

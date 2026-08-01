@@ -118,6 +118,29 @@ export interface PositionResponse extends PositionSummaryResponse {
   warnings: string[];
 }
 
+export interface DividendCalendarEntry {
+  id: string;
+  position_id: string;
+  stock_code: string;
+  stock_name: string;
+  tranche_label: DividendTrancheLabel;
+  per_share_amount: string;
+  qualifying_shares: number;
+  total_amount: string;
+  payment_date: string;
+  ex_dividend_date: string | null;
+  year: number;
+  version: number;
+  created_at: string;
+  updated_at: string;
+  is_paid: boolean;
+  is_upcoming: boolean;
+}
+
+export interface DividendCalendarResponse {
+  tranches: DividendCalendarEntry[];
+}
+
 export interface PortfolioResponse {
   total_all_in_cost: string;
   total_dividend_income_ytd: string;
