@@ -10,6 +10,7 @@ import { AddPositionDialog } from "@/components/portfolio/AddPositionDialog";
 import { Button } from "@/components/ui/button";
 import { useDashboard } from "@/hooks/useDashboard";
 import { useAuth } from "@/lib/auth-context";
+import { CATEGORY_TAG_STYLES } from "@/lib/category-tags";
 
 function formatMoney(value: string): string {
   return "RM " + parseFloat(value).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -18,12 +19,6 @@ function formatMoney(value: string): string {
 function formatShares(value: number): string {
   return value.toLocaleString("en-MY");
 }
-
-const TAG_STYLES: Record<string, string> = {
-  Dividend: "bg-[#E7F5EE] text-[#177A4E]",
-  Volatile: "bg-secondary text-secondary-foreground",
-  Growth: "bg-accent text-accent-foreground",
-};
 
 function DashboardContent() {
   const { user, logout } = useAuth();
@@ -130,7 +125,7 @@ function DashboardContent() {
                             </div>
                           </div>
                           <span
-                            className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${TAG_STYLES[position.category_tag] ?? TAG_STYLES.Dividend}`}
+                            className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${CATEGORY_TAG_STYLES[position.category_tag] ?? CATEGORY_TAG_STYLES.Dividend}`}
                           >
                             {position.category_tag}
                           </span>

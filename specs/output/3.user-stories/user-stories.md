@@ -851,12 +851,12 @@ Then the position detail view updates to show the new blended cost basis and tot
 
 **Acceptance Criteria**
 
-- [ ] Broker field pre-fills to the position's existing default but is editable per lot (BR-003 — brokerage is per-transaction, so a different broker per lot is a valid scenario)
-- [ ] Blended purchase price and updated all-in cost render immediately after submission (SWR revalidation)
+- [x] Broker field pre-fills to the position's first lot's broker but is editable per lot (BR-003 — brokerage is per-transaction, so a different broker per lot is a valid scenario). No backend concept of a position-level "default broker" exists (BE-2.2 Implementation Record) — the pre-fill is a UI decision only, documented in Implementation Record Deviation 1.
+- [x] Blended purchase price and updated all-in cost render immediately after submission (SWR revalidation) — the position detail page's own `usePosition` cache and the dashboard's `useDashboard` cache are both revalidated in place; the user stays on the position page rather than navigating (unlike FE-2.1's Add Position, which does navigate).
 
 **Definition of Done**
 
-- [ ] Verified against BAS US-004 acceptance criteria numerically in a component/integration test
+- [x] Verified against BAS US-004 numerically — not via an automated component test (no frontend test runner exists yet, same gap as FE-2.1), but via a direct Node script confirming the ported `fee-calculator.ts` produces the exact US-004 values (lot 2: RM18,000.00 / RM18.00 / RM5.40 / RM18.00 / RM18,041.40; total after merge: 7,000 shares / RM60,037.87) — see Implementation Record.
 
 **Dependencies & Integrations**
 
@@ -865,6 +865,48 @@ Then the position detail view updates to show the new blended cost basis and tot
 **Technical Constraints**
 
 - None beyond FE-2.1's shared fee-preview components
+
+---
+
+### Implementation Record — FE-2.2
+
+**Design source:** same `BursaTrack.dc.html` `modalAddPos` block as FE-2.1, driven with `lotMode: true` — re-checked via DesignSync (`list_files` showed no new files since FE-2.1) before implementing; no design changes to port.
+
+**What was actually built**
+
+- `components/portfolio/FeePreviewPanel.tsx` (new, extracted) + `hooks/useFeePreview.ts` (new, extracted) — the live fee-breakdown panel and its computation, pulled out of FE-2.1's `AddPositionDialog` so both dialogs share one implementation rather than duplicating ~40 lines of JSX and the preview `useMemo`. `AddPositionDialog.tsx` was refactored to use both (net simplification, not just a rename — this was a natural extraction since a second real consumer just appeared).
+- `components/portfolio/AddLotDialog.tsx` (new) — stock name/code shown read-only (position already exists), shares/price/date/broker fields, broker pre-filled to `position.lots[0].broker_id` but editable, live fee preview. On success: closes, and calls `onLotAdded` with a combined notice string (any EC-004 weekend warning plus a client-side-always-true "Historical dividend records are unaffected" reassurance — see Deviation 2).
+- `app/positions/[id]/page.tsx` — added the "+ Add Lot" button next to the Lots heading, wired `AddLotDialog`, and changed the notice banner from a one-shot `?notice=` query param (FE-2.1's pattern, still used for the redirect-from-Add-Position case) to `useState`-backed so Add Lot can push a fresh notice in place without a navigation.
+- `POST /api/v1/portfolio/positions/{id}/lots` request body confirmed to match `CreateLotRequest` exactly via a live smoke test.
+
+**Deviations from the spec/design (deliberate adaptations, not oversights)**
+
+1. **Broker pre-fill uses the position's *first* lot's broker** (`position.lots[0].broker_id`), matching the design's own `c.p.lots[0].broker` exactly. This is a UI-only decision — BE-2.2's Implementation Record already established there's no backend "default broker" concept for a position — so "first lot" vs. "most recent lot" was a free choice; picked first-lot for design fidelity.
+2. **The "historical dividend records are unaffected" reassurance is always shown after a successful Add Lot**, not conditionally based on whether the position actually has any dividend tranches (it never does yet — Epic 3 isn't built). The design's prototype toast interpolates a live tranche count (`{{ tranches.length }} existing dividend records unchanged`); since that count is always 0 in the real app right now and BR-009's invariant makes the statement true regardless of count, a static reassurance was used instead of a number that would currently always read "0 existing dividend records unchanged" (technically true but reads oddly). Revisit the copy once Epic 3 dividends exist and the count becomes meaningful.
+3. **No live browser verification** — same standing gap as every FE story; the user does their own manual QA and has committed after doing so for FE-2.1. Verification here relied on: clean `npm run build` and `npm run lint`, a Node parity script matching all of BAS US-004 exactly (including the merged-lot totals), a live backend smoke test posing as the frontend (register → create position → add lot with the exact request shape the dialog sends → confirm the position/dashboard GETs the frontend polls after revalidation show the updated aggregates), and confirming both routes still server-render without errors via the Next.js dev server log.
+
+**Test evidence**
+
+- `npm run build`: compiles and type-checks cleanly across all 10 routes.
+- `npm run lint`: clean.
+- Node script: `calculateLotFees(2000, "9.00", maybank)` → exact BAS US-004 lot-2 values; merged total (5,000 + 2,000 shares, RM41,996.47 + RM18,041.40) → RM60,037.87, matching both the BAS wording and BE-2.2's own backend test fixture.
+- Live smoke test: registered a user, created a position, added a lot via the exact JSON shape `AddLotDialog` sends, confirmed 201 with correct fee breakdown, then confirmed both `GET /positions/{id}` and `GET /dashboard` (the two SWR caches the UI revalidates) reflect the updated `total_shares`/`total_all_in_cost`/`blended_purchase_price`.
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session (see Deviation 3) — dialog behavior, live preview updating, and the notice banner rendering are the user's manual QA pass.
+- The dividend-records reassurance copy (Deviation 2) should be revisited once Epic 3 makes tranche counts real.
+
+**Follow-up: design-fidelity correction (post-review)**
+
+The user's manual QA caught that the "+ Add Lot" button didn't match the design. Re-reviewing the design against the position detail page surfaced the button plus three further real mismatches, all fixed in the same pass:
+
+1. **"+ Add Lot" button** — was rendered as the shared `Button variant="outline"` (gray border, foreground text), but the design specifies a distinct style: white background, `#3B4FE0` (primary) text, `#C9D4FA` border, `#F3F5FE` (accent) hover. Replaced with a plain button carrying the exact design classes rather than stretching the shared `Button` component's variant system to fit a style that (so far) only appears here and on one other prototype-only button.
+2. **Category tag colors were swapped for Growth/Volatile.** The design's `tagColors` computation is `Dividend → ['#E7F5EE','#177A4E']`, `Growth → ['#EBF0FF','#2B3EB8']` (= the app's `--secondary`/`--secondary-foreground` tokens), `Volatile → ['#F0F0ED','#5D6069']` (= `--muted`/`--muted-foreground`). The implementation had Growth mapped to `--accent` and Volatile mapped to `--secondary` — neither matched, and the two were effectively swapped. Extracted the correct mapping into `lib/category-tags.ts` (`CATEGORY_TAG_STYLES`) and pointed both the position detail page and the dashboard at it — the dashboard had an independent copy of the identical bug (same file existed twice, not shared), now deleted in favor of the one shared source of truth.
+3. **A second, distinct muted-gray was missing from the design system.** The design uses `#5D6069` for secondary body text (subtitles, descriptions — already correctly mapped to `--muted-foreground` since FE-1.1) but a visibly lighter `#8A8C94` for uppercase eyebrow labels, table column headers, and tertiary meta text (e.g. the stock-code chip). Both had been conflated onto `--muted-foreground` across every screen since FE-1.1 — not a new mistake introduced in FE-2.x, but the first time it was caught. Added a new, purely additive `--tertiary`/`text-tertiary` token (`globals.css`) rather than overloading `--muted-foreground` (which many already-approved screens rely on for the *correct*, darker shade) and applied it precisely where the design specifies `#8A8C94`: the position page's stock-code chip, stat labels, table headers, and footer note, plus the shared `FeePreviewPanel`'s eyebrow label and formula-note lines (which also benefits `AddPositionDialog`, FE-2.1's dialog, as a side effect of fixing the shared component). Deliberately did **not** sweep the rest of the app (dashboard's own table headers, auth screens) in this pass — flagged to the user as a known, separate follow-up rather than silently expanding scope beyond "the position page."
+4. **Two smaller content-fidelity gaps found during the same line-by-line comparison, fixed as they were cheap and clearly in scope for "review the position page against the design":** the Lots table was missing its leading "Lot" (sequence number) column, and the Brokerage/Clearing/Stamp fee cells were missing their hover-tooltip formulas (`title` attributes) and the table footer's "— hover a fee for its formula" trailing text. Row hover (`background:#FAFAF8`) was also added to match the design's `style-hover` on each `<tr>`.
+
+**Verification:** `npm run build` and `npm run lint` clean; confirmed via a direct read of the compiled CSS that `.text-tertiary`, `--tertiary`, and the `border-[#C9D4FA]` arbitrary value all generated correctly; confirmed both `/dashboard` and `/positions/[id]` still server-render without errors via the Next.js dev server log. Visual confirmation of the corrected colors is, as with everything else in Epic 2's frontend, the user's manual QA pass.
 
 ---
 

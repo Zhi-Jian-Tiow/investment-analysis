@@ -1,7 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
 
 import { FeePreviewPanel } from "@/components/portfolio/FeePreviewPanel";
 import { Button } from "@/components/ui/button";
@@ -9,80 +8,67 @@ import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { useDashboard } from "@/hooks/useDashboard";
 import { useBrokers } from "@/hooks/useBrokers";
 import { useFeePreview } from "@/hooks/useFeePreview";
 import { ApiError, apiFetch } from "@/lib/api";
-import {
-  validateBrokerId,
-  validatePurchaseDate,
-  validatePurchasePrice,
-  validateShares,
-  validateStockCode,
-  validateStockName,
-} from "@/lib/position-validation";
-import type { CategoryTag, CreatePositionRequest, PositionResponse } from "@/lib/types";
-
-const CATEGORY_TAGS: CategoryTag[] = ["Dividend", "Volatile", "Growth"];
+import { validatePurchaseDate, validatePurchasePrice, validateShares } from "@/lib/position-validation";
+import type { LotResponse, PositionResponse } from "@/lib/types";
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
 interface FieldErrors {
-  stockCode?: string;
-  stockName?: string;
   shares?: string;
   price?: string;
   purchaseDate?: string;
   brokerId?: string;
 }
 
-interface AddPositionDialogProps {
+interface AddLotDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  position: PositionResponse;
+  onLotAdded: (notice: string) => void;
 }
 
-export function AddPositionDialog({ open, onOpenChange }: AddPositionDialogProps) {
-  const router = useRouter();
+export function AddLotDialog({ open, onOpenChange, position, onLotAdded }: AddLotDialogProps) {
   const { brokers, isLoading: brokersLoading } = useBrokers();
-  const { mutate: revalidateDashboard } = useDashboard();
 
-  const [stockCode, setStockCode] = useState("");
-  const [stockName, setStockName] = useState("");
   const [shares, setShares] = useState("");
   const [price, setPrice] = useState("");
   const [purchaseDate, setPurchaseDate] = useState(todayIso);
   const [brokerId, setBrokerId] = useState("");
-  const [categoryTag, setCategoryTag] = useState<CategoryTag>("Dividend");
 
   const [errors, setErrors] = useState<FieldErrors>({});
   const [genericError, setGenericError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // BR-003 — brokerage is per-transaction, so a per-lot broker override is a
+  // valid scenario. Pre-fills to the position's first lot's broker (there is
+  // no backend notion of a position-level "default broker" — see BE-2.2's
+  // Implementation Record) but is fully editable.
+  useEffect(() => {
+    if (open) setBrokerId(position.lots[0]?.broker_id ?? "");
+  }, [open, position.lots]);
+
   const selectedBroker = useMemo(() => brokers.find((b) => b.id === brokerId), [brokers, brokerId]);
   const preview = useFeePreview(selectedBroker, shares, price);
 
   function resetForm() {
-    setStockCode("");
-    setStockName("");
     setShares("");
     setPrice("");
     setPurchaseDate(todayIso());
-    setBrokerId("");
-    setCategoryTag("Dividend");
     setErrors({});
     setGenericError(null);
   }
 
   function validate(): boolean {
     const next: FieldErrors = {
-      stockCode: validateStockCode(stockCode) ?? undefined,
-      stockName: validateStockName(stockName) ?? undefined,
       shares: validateShares(shares) ?? undefined,
       price: validatePurchasePrice(price) ?? undefined,
       purchaseDate: validatePurchaseDate(purchaseDate) ?? undefined,
-      brokerId: validateBrokerId(brokerId) ?? undefined,
+      brokerId: brokerId ? undefined : "Please select a broker",
     };
     setErrors(next);
     return !Object.values(next).some(Boolean);
@@ -94,32 +80,29 @@ export function AddPositionDialog({ open, onOpenChange }: AddPositionDialogProps
 
     setSubmitting(true);
     try {
-      const body: CreatePositionRequest = {
-        stock_code: stockCode.trim(),
-        stock_name: stockName.trim(),
-        shares: parseInt(shares, 10),
-        purchase_price: price,
-        broker_id: brokerId,
-        purchase_date: purchaseDate,
-        category_tag: categoryTag,
-      };
-      const position = await apiFetch<PositionResponse>("/api/v1/portfolio/positions", {
+      const lot = await apiFetch<LotResponse>(`/api/v1/portfolio/positions/${position.id}/lots`, {
         method: "POST",
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          shares: parseInt(shares, 10),
+          purchase_price: price,
+          broker_id: brokerId,
+          purchase_date: purchaseDate,
+        }),
       });
 
-      await revalidateDashboard();
       onOpenChange(false);
       resetForm();
 
-      const notice = position.warnings.length > 0 ? encodeURIComponent(position.warnings.join(" ")) : null;
-      router.push(notice ? `/positions/${position.id}?notice=${notice}` : `/positions/${position.id}`);
+      // BR-009: historical dividend records are never touched by adding a
+      // lot — true regardless of whether the server sent an EC-004 warning,
+      // so this reassurance is always appended (matches the design's intent
+      // that Add Lot explicitly confirms the invariant to the user).
+      const notices = [...lot.warnings, "Lot added. Historical dividend records are unaffected."];
+      onLotAdded(notices.join(" "));
     } catch (err) {
       if (err instanceof ApiError) {
         if (err.fields?.length) {
           setErrors({
-            stockCode: err.fieldError("stock_code"),
-            stockName: err.fieldError("stock_name"),
             shares: err.fieldError("shares"),
             price: err.fieldError("purchase_price"),
             purchaseDate: err.fieldError("purchase_date"),
@@ -146,7 +129,7 @@ export function AddPositionDialog({ open, onOpenChange }: AddPositionDialogProps
     >
       <DialogContent className="max-w-[640px] p-0 sm:max-w-[640px]">
         <div className="flex items-center justify-between border-b border-border px-6 py-5">
-          <DialogTitle className="text-[17px] font-bold">Add Position</DialogTitle>
+          <DialogTitle className="text-[17px] font-bold">Add Lot — {position.stock_name}</DialogTitle>
         </div>
 
         {genericError && (
@@ -157,76 +140,52 @@ export function AddPositionDialog({ open, onOpenChange }: AddPositionDialogProps
 
         <div className="flex flex-wrap">
           <div className="min-w-[280px] flex-[1.15] px-6 py-5">
-            <div className="mb-1.5 flex gap-3">
-              <div className="flex-1">
-                <Label htmlFor="stock-code" className="mb-1.5 text-[13px] font-semibold">
-                  Stock code <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="stock-code"
-                  value={stockCode}
-                  onChange={(e) => setStockCode(e.target.value)}
-                  placeholder="1023"
-                  aria-invalid={Boolean(errors.stockCode)}
-                />
-                {errors.stockCode && <p className="mt-1 text-xs text-destructive">{errors.stockCode}</p>}
-              </div>
-              <div className="flex-[1.5]">
-                <Label htmlFor="stock-name" className="mb-1.5 text-[13px] font-semibold">
-                  Stock name <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="stock-name"
-                  value={stockName}
-                  onChange={(e) => setStockName(e.target.value)}
-                  placeholder="CIMB Group Holdings Berhad"
-                  aria-invalid={Boolean(errors.stockName)}
-                />
-                {errors.stockName && <p className="mt-1 text-xs text-destructive">{errors.stockName}</p>}
-              </div>
-            </div>
-            <p className="mb-4 text-xs text-muted-foreground">
-              Stock lookup isn&apos;t available yet — enter the Bursa code and name directly.
-            </p>
+            <Label className="mb-1.5 text-[13px] font-semibold">Stock</Label>
+            <Input
+              readOnly
+              value={`${position.stock_name} — ${position.stock_code}`}
+              className="bg-[#FAFAF8] text-muted-foreground"
+            />
+            <div className="h-4" />
 
             <div className="mb-4 flex gap-3">
               <div className="flex-1">
-                <Label htmlFor="shares" className="mb-1.5 text-[13px] font-semibold">
+                <Label htmlFor="lot-shares" className="mb-1.5 text-[13px] font-semibold">
                   Shares <span className="text-destructive">*</span>
                 </Label>
                 <Input
-                  id="shares"
+                  id="lot-shares"
                   inputMode="numeric"
                   value={shares}
                   onChange={(e) => setShares(e.target.value)}
-                  placeholder="5000"
+                  placeholder="2000"
                   aria-invalid={Boolean(errors.shares)}
                 />
                 {errors.shares && <p className="mt-1 text-xs text-destructive">{errors.shares}</p>}
               </div>
               <div className="flex-1">
-                <Label htmlFor="price" className="mb-1.5 text-[13px] font-semibold">
+                <Label htmlFor="lot-price" className="mb-1.5 text-[13px] font-semibold">
                   Price / share (RM) <span className="text-destructive">*</span>
                 </Label>
                 <Input
-                  id="price"
+                  id="lot-price"
                   inputMode="decimal"
                   value={price}
                   onChange={(e) => setPrice(e.target.value)}
-                  placeholder="8.38"
+                  placeholder="9.00"
                   aria-invalid={Boolean(errors.price)}
                 />
                 {errors.price && <p className="mt-1 text-xs text-destructive">{errors.price}</p>}
               </div>
             </div>
 
-            <div className="mb-4 flex gap-3">
+            <div className="flex gap-3">
               <div className="flex-1">
-                <Label htmlFor="purchase-date" className="mb-1.5 text-[13px] font-semibold">
+                <Label htmlFor="lot-purchase-date" className="mb-1.5 text-[13px] font-semibold">
                   Purchase date <span className="text-destructive">*</span>
                 </Label>
                 <Input
-                  id="purchase-date"
+                  id="lot-purchase-date"
                   type="date"
                   value={purchaseDate}
                   onChange={(e) => setPurchaseDate(e.target.value)}
@@ -235,11 +194,11 @@ export function AddPositionDialog({ open, onOpenChange }: AddPositionDialogProps
                 {errors.purchaseDate && <p className="mt-1 text-xs text-destructive">{errors.purchaseDate}</p>}
               </div>
               <div className="flex-1">
-                <Label htmlFor="broker" className="mb-1.5 text-[13px] font-semibold">
+                <Label htmlFor="lot-broker" className="mb-1.5 text-[13px] font-semibold">
                   Broker
                 </Label>
                 <Select value={brokerId} onValueChange={(value) => setBrokerId(value ?? "")}>
-                  <SelectTrigger id="broker" className="w-full" aria-invalid={Boolean(errors.brokerId)}>
+                  <SelectTrigger id="lot-broker" className="w-full" aria-invalid={Boolean(errors.brokerId)}>
                     <SelectValue>
                       {(value: string | null) =>
                         brokers.find((b) => b.id === value)?.name ?? (brokersLoading ? "Loading…" : "Select broker")
@@ -257,24 +216,9 @@ export function AddPositionDialog({ open, onOpenChange }: AddPositionDialogProps
                 {errors.brokerId && <p className="mt-1 text-xs text-destructive">{errors.brokerId}</p>}
               </div>
             </div>
-
-            <Label className="mb-1.5 text-[13px] font-semibold">Category tag</Label>
-            <div className="flex gap-2">
-              {CATEGORY_TAGS.map((tag) => (
-                <button
-                  key={tag}
-                  type="button"
-                  onClick={() => setCategoryTag(tag)}
-                  className={
-                    tag === categoryTag
-                      ? "rounded-full border-[1.5px] border-[#17A05E] bg-[#E7F5EE] px-3.5 py-1.5 text-[12.5px] font-semibold text-[#177A4E]"
-                      : "rounded-full border-[1.5px] border-input px-3.5 py-1.5 text-[12.5px] font-semibold text-muted-foreground hover:border-muted-foreground"
-                  }
-                >
-                  {tag}
-                </button>
-              ))}
-            </div>
+            <p className="mt-2.5 text-xs text-muted-foreground">
+              Brokerage is charged per lot — you can use a different broker than your other lots.
+            </p>
           </div>
 
           <FeePreviewPanel preview={preview} />
@@ -285,7 +229,7 @@ export function AddPositionDialog({ open, onOpenChange }: AddPositionDialogProps
             Cancel
           </Button>
           <Button type="button" onClick={handleSave} disabled={submitting}>
-            {submitting ? "Saving…" : "Save Position"}
+            {submitting ? "Saving…" : "Save Lot"}
           </Button>
         </div>
       </DialogContent>

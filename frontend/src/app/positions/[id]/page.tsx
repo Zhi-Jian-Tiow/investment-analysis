@@ -1,12 +1,18 @@
 "use client";
 
+import Decimal from "decimal.js";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 
 import { AuthGate } from "@/components/auth/AuthGate";
+import { AddLotDialog } from "@/components/portfolio/AddLotDialog";
 import { useBrokers } from "@/hooks/useBrokers";
+import { useDashboard } from "@/hooks/useDashboard";
 import { usePosition } from "@/hooks/usePosition";
+import { brokerNote } from "@/lib/fee-calculator";
+import { CATEGORY_TAG_STYLES } from "@/lib/category-tags";
+import type { BrokerConfigResponse } from "@/lib/types";
 
 function formatMoney(value: string): string {
   return "RM " + parseFloat(value).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -22,22 +28,24 @@ function formatDate(value: string): string {
   return `${d} ${months[m - 1]} ${y}`;
 }
 
-const TAG_STYLES: Record<string, string> = {
-  Dividend: "bg-[#E7F5EE] text-[#177A4E]",
-  Volatile: "bg-secondary text-secondary-foreground",
-  Growth: "bg-accent text-accent-foreground",
-};
-
 function PositionDetailContent() {
   const params = useParams<{ id: string }>();
   const searchParams = useSearchParams();
-  const { position, isLoading, error } = usePosition(params.id);
+  const { position, isLoading, error, mutate: revalidatePosition } = usePosition(params.id);
   const { brokers } = useBrokers();
-  const [noticeVisible, setNoticeVisible] = useState(Boolean(searchParams.get("notice")));
-  const notice = searchParams.get("notice");
+  const { mutate: revalidateDashboard } = useDashboard();
+  const [addLotOpen, setAddLotOpen] = useState(false);
 
-  function brokerName(brokerId: string): string {
-    return brokers.find((b) => b.id === brokerId)?.name ?? brokerId;
+  const [notice, setNotice] = useState<string | null>(searchParams.get("notice"));
+
+  function findBroker(brokerId: string): BrokerConfigResponse | undefined {
+    return brokers.find((b) => b.id === brokerId);
+  }
+
+  async function handleLotAdded(lotNotice: string) {
+    await revalidatePosition();
+    await revalidateDashboard();
+    setNotice(lotNotice);
   }
 
   return (
@@ -75,12 +83,12 @@ function PositionDetailContent() {
 
         {position && (
           <>
-            {notice && noticeVisible && (
+            {notice && (
               <div className="mb-4.5 flex items-start justify-between gap-3 rounded-lg border border-secondary bg-secondary px-3.5 py-3 text-[13px] text-secondary-foreground">
                 <span>{notice}</span>
                 <button
                   type="button"
-                  onClick={() => setNoticeVisible(false)}
+                  onClick={() => setNotice(null)}
                   className="cursor-pointer font-semibold hover:no-underline"
                 >
                   Dismiss
@@ -95,9 +103,9 @@ function PositionDetailContent() {
                     <h1 className="m-0 text-2xl font-bold tracking-tight text-foreground">
                       {position.stock_name}
                     </h1>
-                    <span className="font-mono text-[13px] text-muted-foreground">{position.stock_code}</span>
+                    <span className="font-mono text-[13px] text-tertiary">{position.stock_code}</span>
                     <span
-                      className={`rounded-full px-2.5 py-0.5 text-[11.5px] font-semibold ${TAG_STYLES[position.category_tag] ?? TAG_STYLES.Dividend}`}
+                      className={`rounded-full px-2.5 py-0.5 text-[11.5px] font-semibold ${CATEGORY_TAG_STYLES[position.category_tag] ?? CATEGORY_TAG_STYLES.Dividend}`}
                     >
                       {position.category_tag}
                     </span>
@@ -107,37 +115,37 @@ function PositionDetailContent() {
               </div>
               <div className="mt-4.5 flex flex-wrap gap-7 text-[13.5px]">
                 <div>
-                  <div className="text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                  <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Total shares
                   </div>
                   <div className="mt-0.5 font-semibold">{formatShares(position.total_shares)}</div>
                 </div>
                 <div>
-                  <div className="text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                  <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Blended price
                   </div>
                   <div className="mt-0.5 font-semibold">{formatMoney(position.blended_purchase_price)}</div>
                 </div>
                 <div>
-                  <div className="text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                  <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     All-in cost
                   </div>
                   <div className="mt-0.5 font-semibold">{formatMoney(position.total_all_in_cost)}</div>
                 </div>
                 <div>
-                  <div className="text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                  <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Current price
                   </div>
                   <div className="mt-0.5 font-semibold text-muted-foreground">—</div>
                 </div>
                 <div>
-                  <div className="text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                  <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Income YTD
                   </div>
                   <div className="mt-0.5 font-semibold text-muted-foreground">—</div>
                 </div>
                 <div>
-                  <div className="text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                  <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Unrealised P/L
                   </div>
                   <div className="mt-0.5 font-semibold text-muted-foreground">—</div>
@@ -145,65 +153,95 @@ function PositionDetailContent() {
               </div>
             </div>
 
-            <div className="mb-3 text-[15px] font-bold">Lots ({position.lots.length})</div>
+            <div className="mb-3 flex items-center justify-between">
+              <div className="text-[15px] font-bold">Lots ({position.lots.length})</div>
+              <button
+                type="button"
+                onClick={() => setAddLotOpen(true)}
+                className="rounded-lg border border-[#C9D4FA] bg-card px-3.5 py-2 text-[13.5px] font-semibold text-primary hover:bg-accent focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-2"
+              >
+                + Add Lot
+              </button>
+            </div>
             <div className="rounded-xl border border-border bg-card">
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[920px] border-collapse text-[13.5px]">
+                <table className="w-full min-w-[980px] border-collapse text-[13.5px]">
                   <thead>
                     <tr className="border-b border-border">
-                      <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                        Lot
+                      </th>
+                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         Shares
                       </th>
-                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         Price
                       </th>
-                      <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         Date
                       </th>
-                      <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         Broker
                       </th>
-                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         Initial
                       </th>
-                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         Brokerage
                       </th>
-                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         Clearing
                       </th>
-                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         Stamp
                       </th>
-                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                         All-In Cost
                       </th>
                     </tr>
                   </thead>
                   <tbody>
-                    {position.lots.map((lot) => (
-                      <tr key={lot.id} className="border-b border-[#F0F0ED] last:border-0">
-                        <td className="px-3.5 py-3 text-right">{formatShares(lot.shares)}</td>
-                        <td className="px-3.5 py-3 text-right">{formatMoney(lot.purchase_price)}</td>
-                        <td className="px-3.5 py-3">{formatDate(lot.purchase_date)}</td>
-                        <td className="px-3.5 py-3">{brokerName(lot.broker_id)}</td>
-                        <td className="px-3.5 py-3 text-right">{formatMoney(lot.initial_amount)}</td>
-                        <td className="px-3.5 py-3 text-right">{formatMoney(lot.brokerage_fee)}</td>
-                        <td className="px-3.5 py-3 text-right">{formatMoney(lot.clearing_fee)}</td>
-                        <td className="px-3.5 py-3 text-right">{formatMoney(lot.stamp_duty)}</td>
-                        <td className="px-3.5 py-3 text-right font-bold">{formatMoney(lot.all_in_cost)}</td>
-                      </tr>
-                    ))}
+                    {position.lots.map((lot, index) => {
+                      const broker = findBroker(lot.broker_id);
+                      const brokerageTitle = broker
+                        ? brokerNote(broker, new Decimal(lot.initial_amount))
+                        : undefined;
+                      return (
+                        <tr key={lot.id} className="border-b border-[#F0F0ED] last:border-0 hover:bg-[#FAFAF8]">
+                          <td className="px-3.5 py-3 font-semibold">{index + 1}</td>
+                          <td className="px-3.5 py-3 text-right">{formatShares(lot.shares)}</td>
+                          <td className="px-3.5 py-3 text-right">{formatMoney(lot.purchase_price)}</td>
+                          <td className="px-3.5 py-3">{formatDate(lot.purchase_date)}</td>
+                          <td className="px-3.5 py-3">{broker?.name ?? lot.broker_id}</td>
+                          <td className="px-3.5 py-3 text-right">{formatMoney(lot.initial_amount)}</td>
+                          <td className="px-3.5 py-3 text-right" title={brokerageTitle}>
+                            {formatMoney(lot.brokerage_fee)}
+                          </td>
+                          <td className="px-3.5 py-3 text-right" title="0.03% of initial amount">
+                            {formatMoney(lot.clearing_fee)}
+                          </td>
+                          <td className="px-3.5 py-3 text-right" title="RM1 per RM1,000 (rounded up)">
+                            {formatMoney(lot.stamp_duty)}
+                          </td>
+                          <td className="px-3.5 py-3 text-right font-bold">{formatMoney(lot.all_in_cost)}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
-              <div className="border-t border-[#F0F0ED] bg-[#FAFAF8] px-3.5 py-2.5 font-mono text-xs text-muted-foreground">
-                brokerage per broker rule · clearing 0.03% · stamp duty RM1/RM1,000 (ROUNDUP)
+              <div className="border-t border-[#F0F0ED] bg-[#FAFAF8] px-3.5 py-2.5 font-mono text-xs text-tertiary">
+                brokerage per broker rule · clearing 0.03% · stamp duty RM1/RM1,000 (ROUNDUP) — hover a fee for its
+                formula
               </div>
             </div>
           </>
         )}
       </main>
+
+      {position && (
+        <AddLotDialog open={addLotOpen} onOpenChange={setAddLotOpen} position={position} onLotAdded={handleLotAdded} />
+      )}
     </div>
   );
 }
