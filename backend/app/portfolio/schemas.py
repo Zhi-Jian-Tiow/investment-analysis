@@ -345,6 +345,44 @@ class DividendTrancheResponse(BaseModel):
     updated_at: datetime
 
 
+class DividendCalendarEntry(BaseModel):
+    """Matches the `allOf` shape in components/schemas/DividendCalendarResponse's
+    `tranches` items (03-openapi-specification.md): every DividendTrancheResponse
+    field plus stock_code/stock_name.
+
+    `is_paid`/`is_upcoming` are additive (not in the OpenAPI spec) — BE-3.3's
+    AC requires "past dates flagged Paid; upcoming dates within 7 days
+    flagged for highlighting," and the server is the natural place to
+    compute these consistently (same "today" reference, no client-clock
+    drift) rather than pushing date-math into the not-yet-built FE-3.3.
+    """
+
+    id: UUID
+    position_id: UUID
+    stock_code: str
+    stock_name: str
+    tranche_label: str
+    per_share_amount: Decimal
+    qualifying_shares: int
+    total_amount: Decimal
+    payment_date: date
+    ex_dividend_date: date | None = None
+    year: int
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    is_paid: bool
+    is_upcoming: bool
+
+
+class DividendCalendarResponse(BaseModel):
+    """Matches components/schemas/DividendCalendarResponse in
+    03-openapi-specification.md.
+    """
+
+    tranches: list[DividendCalendarEntry]
+
+
 class PositionSummaryResponse(BaseModel):
     """Matches components/schemas/PositionSummaryResponse in
     03-openapi-specification.md — the list-row shape used by

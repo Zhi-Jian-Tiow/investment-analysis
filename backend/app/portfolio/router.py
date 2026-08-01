@@ -1,7 +1,8 @@
+from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user, get_current_user_optional
@@ -16,6 +17,8 @@ from app.portfolio.schemas import (
     CreateDividendRequest,
     CreateLotRequest,
     CreatePositionRequest,
+    DividendCalendarEntry,
+    DividendCalendarResponse,
     DividendTrancheResponse,
     LotResponse,
     PortfolioResponse,
@@ -32,6 +35,7 @@ from app.portfolio.service import (
     delete_dividend_tranche,
     delete_lot,
     delete_position,
+    get_dividend_calendar,
     get_owned_active_position,
     get_portfolio_for_user,
     get_position_dividend_tranches,
@@ -284,6 +288,49 @@ async def add_dividend(
     portfolio = await get_portfolio_for_user(db, current_user.id)
     tranche = await create_dividend_tranche(db, current_user.id, portfolio.id, body)
     return DividendTrancheResponse.model_validate(tranche)
+
+
+@router.get("/portfolio/dividends", response_model=DividendCalendarResponse)
+@limiter.limit("60/minute")
+async def get_dividend_calendar_endpoint(
+    request: Request,
+    year: int | None = Query(None, ge=1990),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DividendCalendarResponse:
+    """BE-3.3: chronological dividend calendar across the whole portfolio,
+    scoped by calendar year (OpenAPI's documented `year` query param,
+    defaulting to the current year — see get_dividend_calendar's docstring
+    for why this doesn't literally implement the AC's "future + trailing 30
+    days" framing).
+    """
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    effective_year = year if year is not None else date.today().year
+    rows = await get_dividend_calendar(db, portfolio.id, effective_year)
+
+    return DividendCalendarResponse(
+        tranches=[
+            DividendCalendarEntry(
+                id=row.tranche.id,
+                position_id=row.tranche.position_id,
+                stock_code=row.stock_code,
+                stock_name=row.stock_name,
+                tranche_label=row.tranche.tranche_label,
+                per_share_amount=row.tranche.per_share_amount,
+                qualifying_shares=row.tranche.qualifying_shares,
+                total_amount=row.tranche.total_amount,
+                payment_date=row.tranche.payment_date,
+                ex_dividend_date=row.tranche.ex_dividend_date,
+                year=row.tranche.year,
+                version=row.tranche.version,
+                created_at=row.tranche.created_at,
+                updated_at=row.tranche.updated_at,
+                is_paid=row.is_paid,
+                is_upcoming=row.is_upcoming,
+            )
+            for row in rows
+        ]
+    )
 
 
 @router.patch("/portfolio/dividends/{tranche_id}", response_model=DividendTrancheResponse)

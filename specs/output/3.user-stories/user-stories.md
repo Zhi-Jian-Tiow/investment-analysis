@@ -1236,13 +1236,13 @@ Then entries are returned in ascending chronological order by ex_dividend_date (
 
 **Acceptance Criteria**
 
-- [ ] Each entry includes stock name, tranche label, ex-date, payment date, per_share_amount, and the **stored** total_amount (not re-derived) — display must make clear this reflects the qualifying_shares basis at logging time (FR-013 step 3 fix)
-- [ ] Past dates flagged "Paid"; upcoming dates within 7 days flagged for highlighting
-- [ ] Empty state (no ex-dates recorded) returns a payload the frontend can render as the guidance message
+- [x] Each entry includes stock name, tranche label, ex-date, payment date, per_share_amount, and the **stored** total_amount (not re-derived) — display must make clear this reflects the qualifying_shares basis at logging time (FR-013 step 3 fix)
+- [x] Past dates flagged "Paid" (`is_paid`, based on `payment_date < today`); upcoming dates within 7 days flagged for highlighting (`is_upcoming`, based on the same ex-date-falling-back-to-payment-date reference the sort order uses) — both additive fields, computed server-side so every client shares one "today" reference
+- [x] Empty state (no tranches for the queried year) returns `{"tranches": []}`, not an error — verified explicitly
 
 **Definition of Done**
 
-- [ ] Query correctly filters soft-deleted tranches (`is_deleted=false`)
+- [x] Query correctly filters soft-deleted tranches (`is_deleted=false`) — and, defensively, tranches on soft-deleted positions too, even though that's already redundant with BE-2.4/BE-3.1's cascade delete
 
 **Dependencies & Integrations**
 
@@ -1250,9 +1250,38 @@ Then entries are returned in ascending chronological order by ex_dividend_date (
 
 **Technical Constraints**
 
-- None beyond standard read-path query performance (indexed on `dividend_tranches(position_id, year, is_deleted)` per architecture §8.3)
+- None beyond standard read-path query performance (indexed on `dividend_tranches(position_id, year, is_deleted)` per architecture §8.3) — no explicit load test was run (this project has no performance-testing infrastructure), but the query is a straightforward indexed join with no N+1 pattern
 
 ---
+
+### Implementation Record — BE-3.3
+
+**What was actually built**
+
+- `app/portfolio/schemas.py` — `DividendCalendarEntry` (every `DividendTrancheResponse` field plus `stock_code`/`stock_name`, matching the OpenAPI `allOf` shape, plus the additive `is_paid`/`is_upcoming` flags), `DividendCalendarResponse`.
+- `app/portfolio/service.py` — `get_dividend_calendar` (portfolio-wide join across all positions, filtered by `year`, sorted by `ex_dividend_date` falling back to `payment_date`, with `is_paid`/`is_upcoming` computed per row), returning a small `DividendCalendarRow` `NamedTuple` (tranche + stock_code + stock_name + the two flags) rather than a bare ORM object, since the response needs data that spans two tables.
+- `app/portfolio/router.py` — `GET /api/v1/portfolio/dividends?year=` (optional, defaults to the current calendar year per the OpenAPI spec).
+- No migration needed — purely a new read query over existing tables, no schema change.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **A real conflict between the OpenAPI spec and this story's own AC, resolved in favor of the OpenAPI contract.** The OpenAPI's documented `GET /dividends` has a `year` query parameter that "Defaults to the current calendar year if omitted" — a calendar-year-boundary filter. BE-3.3's own Gherkin instead describes "scoped to future dates plus the trailing 30 days" — a rolling window relative to today, unrelated to calendar-year boundaries; on any date these two framings return genuinely different result sets (e.g. in January, "current year" spans 12 months ahead while "future + trailing 30 days" spans about one month). Implemented the OpenAPI's `year`-based contract, since it's the stable, already-documented API shape a future FE-3.3 (and any other future consumer) would code against. Interpreted the AC's "future + trailing 30 days" language as describing FE-3.3's eventual *default view* of this data — a year's worth of entries is a superset a frontend can filter down to that rolling window — rather than a distinct backend query the endpoint itself must implement. If this reading is wrong, it's a straightforward follow-up to add a second `from`/`to` date-range mode alongside (not instead of) the existing `year` param.
+2. **`is_paid`/`is_upcoming` are additive fields, not in the OpenAPI schema.** The AC explicitly requires this display behavior ("Past dates flagged 'Paid'; upcoming dates within 7 days flagged for highlighting"), and computing it server-side (one shared "today" reference) is more correct than pushing date math into each client, consistent with this project's established pattern of additive fields for AC requirements the documented schema didn't anticipate (e.g. `warnings` throughout Epic 2).
+
+**Test evidence**
+
+- `uv run pytest`: 174/174 passing (163 pre-existing + 11 new): empty state, auth requirement, stock name/code included, default-to-current-year, explicit `year` filtering, correct chronological ordering (including the no-ex-date-falls-back-to-payment-date case, verified with three interleaved entries logged out of order), spanning multiple positions in one response, excluding soft-deleted tranches, excluding tranches on soft-deleted positions, excluding another user's tranches entirely, and the `is_paid` flag reflecting a genuinely past payment date.
+- Live smoke test against the real backend + Postgres: logged three dividends across two positions with deliberately out-of-order ex-dates, confirmed the default (current-year) calendar returns all three correctly ordered by ex-date with the right stock names and `is_paid` flags, and confirmed `?year=2025` correctly returns an empty list.
+- `npm run build` (frontend): clean — no frontend changes were needed (no FE-3.x UI exists yet).
+
+**Known gaps / not yet verified**
+
+- No live browser interaction (FE-3.3 is a separate, not-yet-built story).
+- The OpenAPI-vs-AC date-scoping conflict (Deviation 1) should be revisited once FE-3.3 actually builds the calendar view and it becomes clear which framing the product actually needs.
+
+---
+
+**Epic 3 backend is now complete.** All three BE-3.x stories (Log Dividend Tranche with the P0 qualifying_shares invariant, Edit/Delete Dividend Tranche, Dividend Calendar Aggregation) are implemented, tested, and verified live against real Postgres. Epic 3's frontend (FE-3.1–3.3) is next.
 
 ## FE-3.1 — Log Dividend Tranche Form
 

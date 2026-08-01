@@ -6,13 +6,14 @@ BE-1.1 needs broker lookup + portfolio creation at registration. FE-1.1 needs
 list_brokers to populate the registration form's broker dropdown (see
 app.auth.dependencies.get_current_user_optional for why this is reachable
 pre-login). BE-2.1 adds position/lot creation. BE-3.1 adds dividend tranche
-logging; BE-3.2 adds editing/deleting a tranche.
+logging; BE-3.2 adds editing/deleting a tranche; BE-3.3 adds the calendar
+aggregation read.
 """
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -759,3 +760,53 @@ async def delete_dividend_tranche(db: AsyncSession, user_id: uuid.UUID, portfoli
     )
 
     await db.commit()
+
+
+class DividendCalendarRow(NamedTuple):
+    tranche: DividendTranche
+    stock_code: str
+    stock_name: str
+    is_paid: bool
+    is_upcoming: bool
+
+
+async def get_dividend_calendar(db: AsyncSession, portfolio_id: uuid.UUID, year: int) -> list[DividendCalendarRow]:
+    """BE-3.3. Scoped by calendar `year` (OpenAPI's documented query param,
+    defaulting to the current year) — not the AC's "future dates plus the
+    trailing 30 days" framing, which reads as describing FE-3.3's eventual
+    default *view* of this data (a year's worth of entries is a superset a
+    frontend can filter further) rather than a distinct backend query
+    contract. See BE-3.3's Implementation Record for the full reasoning.
+
+    Excludes tranches on soft-deleted positions too, not just soft-deleted
+    tranches — a position's own soft-delete already cascades to its tranches
+    (BE-2.4, extended in BE-3.1), so this filter is largely redundant with
+    that in practice, but explicit here for defense in depth.
+    """
+    result = await db.execute(
+        select(DividendTranche, Position.stock_code, Position.stock_name)
+        .join(Position, DividendTranche.position_id == Position.id)
+        .where(
+            Position.portfolio_id == portfolio_id,
+            Position.is_deleted.is_(False),
+            DividendTranche.is_deleted.is_(False),
+            DividendTranche.year == year,
+        )
+    )
+    rows = result.all()
+
+    today = date.today()
+    entries = [
+        DividendCalendarRow(
+            tranche=tranche,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            is_paid=tranche.payment_date < today,
+            is_upcoming=today <= (tranche.ex_dividend_date or tranche.payment_date) <= today + timedelta(days=7),
+        )
+        for tranche, stock_code, stock_name in rows
+    ]
+
+    # OpenAPI: "ascending by ex_dividend_date (falling back to payment_date)".
+    entries.sort(key=lambda e: e.tranche.ex_dividend_date or e.tranche.payment_date)
+    return entries
