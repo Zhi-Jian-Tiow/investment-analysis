@@ -8,6 +8,7 @@ import { Suspense, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AddDividendDialog } from "@/components/portfolio/AddDividendDialog";
 import { AddLotDialog } from "@/components/portfolio/AddLotDialog";
+import { EditDividendDialog } from "@/components/portfolio/EditDividendDialog";
 import { EditLotDialog } from "@/components/portfolio/EditLotDialog";
 import { ConfirmDialog } from "@/components/shared/ConfirmDialog";
 import { Button } from "@/components/ui/button";
@@ -47,6 +48,8 @@ function PositionDetailContent() {
   const [deletingLotId, setDeletingLotId] = useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [addDividendOpen, setAddDividendOpen] = useState(false);
+  const [editingTrancheId, setEditingTrancheId] = useState<string | null>(null);
+  const [deletingTrancheId, setDeletingTrancheId] = useState<string | null>(null);
 
   const [notice, setNotice] = useState<string | null>(searchParams.get("notice"));
 
@@ -68,6 +71,8 @@ function PositionDetailContent() {
 
   const editingLot = position?.lots.find((l) => l.id === editingLotId) ?? null;
   const deletingLot = position?.lots.find((l) => l.id === deletingLotId) ?? null;
+  const editingTranche = position?.dividend_tranches.find((t) => t.id === editingTrancheId) ?? null;
+  const deletingTranche = position?.dividend_tranches.find((t) => t.id === deletingTrancheId) ?? null;
 
   async function handleDeletePosition() {
     if (!position) return;
@@ -86,6 +91,21 @@ function PositionDetailContent() {
 
   function handleDividendLogged(dividendNotice: string) {
     setNotice(dividendNotice);
+  }
+
+  function handleDividendEdited(dividendNotice: string) {
+    setNotice(dividendNotice);
+  }
+
+  async function handleDeleteDividend() {
+    if (!position || !deletingTranche) return;
+    await apiFetch(`/api/v1/portfolio/dividends/${deletingTranche.id}`, { method: "DELETE" });
+    const freshPosition = await revalidatePosition();
+    await revalidateDashboard();
+    const yieldPercent = freshPosition
+      ? formatPercent(computeYieldPercent(freshPosition.total_dividend_income_ytd, freshPosition.total_all_in_cost))
+      : "—";
+    setNotice(`${deletingTranche.tranche_label} dividend deleted. Position yield is now ${yieldPercent}.`);
   }
 
   return (
@@ -331,6 +351,8 @@ function PositionDetailContent() {
               <DividendsTab
                 position={position}
                 onAddDividend={() => setAddDividendOpen(true)}
+                onEditDividend={(id) => setEditingTrancheId(id)}
+                onDeleteDividend={(id) => setDeletingTrancheId(id)}
               />
             )}
           </>
@@ -384,11 +406,46 @@ function PositionDetailContent() {
           onConfirm={handleDeleteLot}
         />
       )}
+      {position && editingTranche && (
+        <EditDividendDialog
+          open={Boolean(editingTrancheId)}
+          onOpenChange={(next) => {
+            if (!next) setEditingTrancheId(null);
+          }}
+          position={position}
+          tranche={editingTranche}
+          revalidatePosition={revalidatePosition}
+          revalidateDashboard={revalidateDashboard}
+          onSaved={handleDividendEdited}
+        />
+      )}
+      {position && deletingTranche && (
+        <ConfirmDialog
+          open={Boolean(deletingTrancheId)}
+          onOpenChange={(next) => {
+            if (!next) setDeletingTrancheId(null);
+          }}
+          title="Delete this dividend record?"
+          description="This cannot be undone."
+          confirmLabel="Delete"
+          onConfirm={handleDeleteDividend}
+        />
+      )}
     </div>
   );
 }
 
-function DividendsTab({ position, onAddDividend }: { position: PositionResponse; onAddDividend: () => void }) {
+function DividendsTab({
+  position,
+  onAddDividend,
+  onEditDividend,
+  onDeleteDividend,
+}: {
+  position: PositionResponse;
+  onAddDividend: () => void;
+  onEditDividend: (id: string) => void;
+  onDeleteDividend: (id: string) => void;
+}) {
   const currentYear = new Date().getFullYear();
   const tranchesThisYear = position.dividend_tranches.filter((t) => t.year === currentYear);
   const dividendPerShareYtd = tranchesThisYear.reduce((sum, t) => sum + parseFloat(t.per_share_amount), 0);
@@ -433,7 +490,7 @@ function DividendsTab({ position, onAddDividend }: { position: PositionResponse;
       ) : (
         <div className="rounded-xl border border-border bg-card">
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[860px] border-collapse text-[13.5px]">
+            <table className="w-full min-w-[960px] border-collapse text-[13.5px]">
               <thead>
                 <tr className="border-b border-border">
                   <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
@@ -453,6 +510,9 @@ function DividendsTab({ position, onAddDividend }: { position: PositionResponse;
                   </th>
                   <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Ex-Date
+                  </th>
+                  <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                    Actions
                   </th>
                 </tr>
               </thead>
@@ -481,6 +541,22 @@ function DividendsTab({ position, onAddDividend }: { position: PositionResponse;
                         <td className="px-3.5 py-3">{formatDate(tranche.payment_date)}</td>
                         <td className="px-3.5 py-3 text-muted-foreground">
                           {tranche.ex_dividend_date ? formatDate(tranche.ex_dividend_date) : "—"}
+                        </td>
+                        <td className="px-3.5 py-3 text-right whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => onEditDividend(tranche.id)}
+                            className="cursor-pointer rounded-[5px] px-1.5 py-1 text-[12.5px] font-semibold text-primary hover:bg-accent"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onDeleteDividend(tranche.id)}
+                            className="cursor-pointer rounded-[5px] px-1.5 py-1 text-[12.5px] font-semibold text-destructive hover:bg-destructive/10"
+                          >
+                            Delete
+                          </button>
                         </td>
                       </tr>
                     );

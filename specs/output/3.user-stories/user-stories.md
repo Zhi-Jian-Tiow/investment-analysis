@@ -1367,12 +1367,12 @@ Then the recalculated total_amount and updated yield render after save, and a de
 
 **Acceptance Criteria**
 
-- [ ] Attempting to set qualifying_shares above the current position total shows: "Qualifying shares cannot exceed the position's current total shares ([N])"
-- [ ] Uses the shared `ConfirmDialog` component (consistent with FE-2.4)
+- [x] Attempting to set qualifying_shares above the current position total shows: "Qualifying shares cannot exceed the position's current total shares ([N])"
+- [x] Uses the shared `ConfirmDialog` component (consistent with FE-2.4)
 
 **Definition of Done**
 
-- [ ] BAS US-012 error scenario covered
+- [x] BAS US-012 error scenario covered
 
 **Dependencies & Integrations**
 
@@ -1381,6 +1381,31 @@ Then the recalculated total_amount and updated yield render after save, and a de
 **Technical Constraints**
 
 - None additional
+
+---
+
+### Implementation Record — FE-3.2
+
+**Design source:** `BursaTrack.dc.html` — no dedicated edit-dividend modal exists in the design (only `modalAddDiv`); re-used its layout and the design's own `d.edit`/`d.del` Actions-column button styling from the Lots table, consistent with how FE-2.3 (`EditLotDialog`) was built without a distinct design block either.
+
+**What was actually built**
+
+- `components/portfolio/EditDividendDialog.tsx` (new) — combines `EditLotDialog`'s optimistic-locking/409-conflict pattern (version tracked in state, amber conflict banner with a "Refresh" action that repopulates all fields from the latest server data) with `AddDividendDialog`'s field layout, validation, and live "Total received this tranche" preview. Per-share amount, qualifying shares (with the same EC-023 amber note and BAS-verbatim guidance text as Add), payment date, and ex-date are all editable; `tranche_label` is not (see Deviation 1). On save, revalidates the position and dashboard, then surfaces a notice with the recalculated total and updated yield — same pattern as Add.
+- `app/positions/[id]/page.tsx` — added `editingTrancheId`/`deletingTrancheId` state and `editingTranche`/`deletingTranche` derivations, mirroring the existing `editingLotId`/`deletingLotId` pattern exactly. Added an Actions column (Edit/Delete buttons, same styling as the Lots table's) to `DividendsTab`'s table. Added `handleDividendEdited` and `handleDeleteDividend` (calls `DELETE /dividends/{id}`, revalidates position + dashboard, then shows a notice with the post-delete yield). Mounted `EditDividendDialog` and a new `ConfirmDialog` instance for dividend deletion.
+
+**Deviations from the spec/design (deliberate adaptations, not oversights)**
+
+1. **`tranche_label` is not editable in the edit dialog**, even though the backend's `UpdateDividendRequest`/`PATCH /dividends/{id}` accepts it. Neither this story's AC nor Gherkin mention relabeling a tranche, and allowing it would let a user silently collide with — or vacate — another tranche's label within the same BR-014 year-cap without any UI to reconcile the resulting gap. Scoped the edit dialog to the fields the story actually calls out (amount, qualifying shares, dates); the dialog title itself displays the label read-only.
+2. **The delete confirmation uses the Gherkin's exact copy** ("Delete this dividend record? This cannot be undone.") rather than a richer, position-specific description like the Lot/Position delete dialogs use — this story's AC only specifies that exact string, unlike FE-2.4/2.5 where the richer copy was this project's own judgment call, not a spec requirement.
+
+**Test evidence**
+
+- `npm run build` and `npm run lint`: clean.
+- Live smoke test against the real backend + Postgres, exercising the full flow `EditDividendDialog`/the new delete action depend on: create position → log tranche (5,000 × RM0.20 → RM1,000.00) → `PATCH` per-share to RM0.22 → confirmed `total_amount` recalculates to RM1,100.00 and `GET /positions/{id}` reflects `total_dividend_income_ytd: "1100.00"` → repeating the same `PATCH` with the now-stale `version` returns 409 (`version_conflict`), reproducing exactly what triggers `EditDividendDialog`'s conflict banner → `PATCH` with `qualifying_shares: 6000` against a 5,000-share position returns the exact comma-formatted copy this AC requires: `"Qualifying shares cannot exceed the position's current total shares (5,000)"` → added a new lot (position now 6,000 shares total) and reconfirmed the existing tranche's `total_amount` stayed RM1,100.00 (EC-022, re-verified from the edit-then-add-lot direction) → `DELETE /dividends/{id}` → 204, and `GET /positions/{id}` confirms `total_dividend_income_ytd` returns to `"0.00"` and `dividend_tranches` is empty.
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session — the Edit/Delete buttons rendering, the conflict banner's "Refresh" flow, and the ConfirmDialog's auto-close-on-success behavior are the user's manual QA pass, same standing gap as every FE story.
 
 ---
 
