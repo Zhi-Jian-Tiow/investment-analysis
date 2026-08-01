@@ -6,7 +6,7 @@ BE-1.1 needs broker lookup + portfolio creation at registration. FE-1.1 needs
 list_brokers to populate the registration form's broker dropdown (see
 app.auth.dependencies.get_current_user_optional for why this is reachable
 pre-login). BE-2.1 adds position/lot creation. BE-3.1 adds dividend tranche
-logging.
+logging; BE-3.2 adds editing/deleting a tranche.
 """
 
 import uuid
@@ -25,6 +25,7 @@ from app.portfolio.schemas import (
     CreateDividendRequest,
     CreateLotRequest,
     CreatePositionRequest,
+    UpdateDividendRequest,
     UpdateLotRequest,
     UpdatePositionRequest,
 )
@@ -526,6 +527,48 @@ def position_dividend_income_ytd(tranches: list[DividendTranche]) -> Decimal:
     )
 
 
+def _check_qualifying_shares_bound(qualifying_shares: int, position_total_shares: int) -> None:
+    # VR-011 — shared by create (BE-3.1) and edit (BE-3.2, the "on edit" clause).
+    if qualifying_shares > position_total_shares:
+        raise validation_error(
+            "One or more fields failed validation.",
+            fields=[
+                {
+                    "field": "qualifying_shares",
+                    "constraint": f"Qualifying shares cannot exceed the position's current total shares ({position_total_shares:,})",
+                    "received": str(qualifying_shares),
+                }
+            ],
+        )
+
+
+def _check_tranche_year_constraints(
+    tranches_for_year: list[DividendTranche], year: int, tranche_label: str, stock_name: str
+) -> None:
+    """BR-014 (max 8 per year) and the duplicate-label rule (not spec-mandated
+    — see create_dividend_tranche's docstring). Shared by create and edit;
+    callers must pre-filter `tranches_for_year` to exclude the tranche being
+    edited itself.
+    """
+    if len(tranches_for_year) >= 8:
+        raise validation_error(
+            f"Maximum of 8 dividend tranches per year reached for {stock_name} ({year}).",
+            fields=[{"field": "tranche_label", "constraint": "maximum of 8 tranches per year", "received": None}],
+        )
+
+    if any(t.tranche_label == tranche_label for t in tranches_for_year):
+        raise validation_error(
+            "One or more fields failed validation.",
+            fields=[
+                {
+                    "field": "tranche_label",
+                    "constraint": f"A {tranche_label} tranche already exists for {year}",
+                    "received": tranche_label,
+                }
+            ],
+        )
+
+
 async def create_dividend_tranche(
     db: AsyncSession, user_id: uuid.UUID, portfolio_id: uuid.UUID, data: CreateDividendRequest
 ) -> DividendTranche:
@@ -541,44 +584,11 @@ async def create_dividend_tranche(
 
     lots = await get_position_lots(db, position.id)
     position_total_shares, _, _ = position_aggregates(lots)
-
-    if data.qualifying_shares > position_total_shares:
-        raise validation_error(
-            "One or more fields failed validation.",
-            fields=[
-                {
-                    "field": "qualifying_shares",
-                    "constraint": f"Qualifying shares cannot exceed the position's current total shares ({position_total_shares})",
-                    "received": str(data.qualifying_shares),
-                }
-            ],
-        )
+    _check_qualifying_shares_bound(data.qualifying_shares, position_total_shares)
 
     existing_tranches = await get_position_dividend_tranches(db, position.id)
     tranches_for_year = [t for t in existing_tranches if t.year == year]
-
-    if len(tranches_for_year) >= 8:
-        # BR-014
-        raise validation_error(
-            f"Maximum of 8 dividend tranches per year reached for {position.stock_name} ({year}).",
-            fields=[{"field": "tranche_label", "constraint": "maximum of 8 tranches per year", "received": None}],
-        )
-
-    if any(t.tranche_label == data.tranche_label for t in tranches_for_year):
-        # Not spec-mandated (no BR/VR covers duplicate labels within a year;
-        # BR-014 only caps the count) — a judgment call to keep "1st"/"2nd"
-        # labels meaningful, matching the design prototype's intent of
-        # auto-suggesting the next unused label.
-        raise validation_error(
-            "One or more fields failed validation.",
-            fields=[
-                {
-                    "field": "tranche_label",
-                    "constraint": f"A {data.tranche_label} tranche already exists for {year}",
-                    "received": data.tranche_label,
-                }
-            ],
-        )
+    _check_tranche_year_constraints(tranches_for_year, year, data.tranche_label, position.stock_name)
 
     total_amount = round_myr(data.per_share_amount * data.qualifying_shares)
 
@@ -609,3 +619,143 @@ async def create_dividend_tranche(
     await db.commit()
     await db.refresh(tranche)
     return tranche
+
+
+async def get_owned_dividend_tranche(db: AsyncSession, portfolio_id: uuid.UUID, tranche_id: uuid.UUID) -> DividendTranche:
+    """Dividends aren't nested under a position_id in the URL (unlike Lots) —
+    `PATCH/DELETE /dividends/{id}` only carries the tranche id — so ownership
+    is verified by joining through the tranche's own Position to the caller's
+    portfolio. Returns 404, never 403, matching every other ownership check
+    in this module.
+    """
+    result = await db.execute(
+        select(DividendTranche)
+        .join(Position, DividendTranche.position_id == Position.id)
+        .where(
+            DividendTranche.id == tranche_id,
+            DividendTranche.is_deleted.is_(False),
+            Position.portfolio_id == portfolio_id,
+            Position.is_deleted.is_(False),
+        )
+    )
+    tranche = result.scalar_one_or_none()
+    if tranche is None:
+        raise not_found()
+    return tranche
+
+
+async def update_dividend_tranche(
+    db: AsyncSession, user_id: uuid.UUID, portfolio_id: uuid.UUID, tranche_id: uuid.UUID, data: UpdateDividendRequest
+) -> DividendTranche:
+    """BE-3.2 — BAS US-012. total_amount is always recomputed from the
+    resulting per_share_amount x qualifying_shares (whichever changed, using
+    the tranche's own previously-stored value for whichever didn't) — never
+    from the current position_total_shares (that's still BR-009/BR-027's
+    invariant; only an explicit edit like this one may change total_amount).
+    """
+    tranche = await get_owned_dividend_tranche(db, portfolio_id, tranche_id)
+
+    new_per_share_amount = data.per_share_amount if data.per_share_amount is not None else tranche.per_share_amount
+    new_qualifying_shares = (
+        data.qualifying_shares if data.qualifying_shares is not None else tranche.qualifying_shares
+    )
+    new_tranche_label = data.tranche_label if data.tranche_label is not None else tranche.tranche_label
+    new_payment_date = data.payment_date if data.payment_date is not None else tranche.payment_date
+    new_ex_dividend_date = data.ex_dividend_date if data.ex_dividend_date is not None else tranche.ex_dividend_date
+    new_year = new_payment_date.year
+
+    if new_ex_dividend_date is not None and new_ex_dividend_date > new_payment_date:
+        # VR-010, re-validated against the merged (existing + override) dates.
+        raise validation_error(
+            "One or more fields failed validation.",
+            fields=[
+                {
+                    "field": "ex_dividend_date",
+                    "constraint": "Ex-dividend date must be before or on the payment date",
+                    "received": new_ex_dividend_date.isoformat(),
+                }
+            ],
+        )
+
+    position = await get_owned_active_position(db, portfolio_id, tranche.position_id)
+    lots = await get_position_lots(db, position.id)
+    position_total_shares, _, _ = position_aggregates(lots)
+    _check_qualifying_shares_bound(new_qualifying_shares, position_total_shares)
+
+    existing_tranches = await get_position_dividend_tranches(db, position.id)
+    tranches_for_year = [t for t in existing_tranches if t.year == new_year and t.id != tranche.id]
+    _check_tranche_year_constraints(tranches_for_year, new_year, new_tranche_label, position.stock_name)
+
+    previous_values = {
+        "tranche_label": tranche.tranche_label,
+        "per_share_amount": str(tranche.per_share_amount),
+        "qualifying_shares": tranche.qualifying_shares,
+        "payment_date": tranche.payment_date.isoformat(),
+        "ex_dividend_date": tranche.ex_dividend_date.isoformat() if tranche.ex_dividend_date else None,
+        "year": tranche.year,
+        "total_amount": str(tranche.total_amount),
+    }
+
+    new_total_amount = round_myr(new_per_share_amount * new_qualifying_shares)
+
+    result = await db.execute(
+        update(DividendTranche)
+        .where(DividendTranche.id == tranche_id, DividendTranche.version == data.version)
+        .values(
+            tranche_label=new_tranche_label,
+            per_share_amount=new_per_share_amount,
+            qualifying_shares=new_qualifying_shares,
+            payment_date=new_payment_date,
+            ex_dividend_date=new_ex_dividend_date,
+            year=new_year,
+            total_amount=new_total_amount,
+            version=DividendTranche.version + 1,
+        )
+    )
+    if result.rowcount == 0:
+        await db.rollback()
+        raise version_conflict()
+
+    new_values = {
+        "tranche_label": new_tranche_label,
+        "per_share_amount": str(new_per_share_amount),
+        "qualifying_shares": new_qualifying_shares,
+        "payment_date": new_payment_date.isoformat(),
+        "ex_dividend_date": new_ex_dividend_date.isoformat() if new_ex_dividend_date else None,
+        "year": new_year,
+        "total_amount": str(new_total_amount),
+    }
+    await record_audit_event(
+        db,
+        user_id=user_id,
+        action="DIVIDEND_UPDATED",
+        entity_type="DividendTranche",
+        entity_id=tranche.id,
+        metadata={"previous_values": previous_values, "new_values": new_values},
+    )
+
+    await db.commit()
+    await db.refresh(tranche)
+    return tranche
+
+
+async def delete_dividend_tranche(db: AsyncSession, user_id: uuid.UUID, portfolio_id: uuid.UUID, tranche_id: uuid.UUID) -> None:
+    """BE-3.2: soft-delete only (A-010). Position/portfolio dividend-income
+    YTD naturally excludes it afterward since position_dividend_income_ytd
+    already sums non-deleted tranches only.
+    """
+    tranche = await get_owned_dividend_tranche(db, portfolio_id, tranche_id)
+
+    tranche.is_deleted = True
+    tranche.deleted_at = datetime.now(timezone.utc)
+
+    await record_audit_event(
+        db,
+        user_id=user_id,
+        action="DIVIDEND_DELETED",
+        entity_type="DividendTranche",
+        entity_id=tranche.id,
+        metadata={"position_id": str(tranche.position_id), "total_amount": str(tranche.total_amount)},
+    )
+
+    await db.commit()

@@ -38,6 +38,29 @@ def _check_purchase_date(value: date) -> date:
     return value
 
 
+def _check_tranche_label(value: str) -> str:
+    if value not in _TRANCHE_LABELS:
+        raise ValueError(f"tranche_label must be one of {_TRANCHE_LABELS}")
+    return value
+
+
+def _check_per_share_amount(value: Decimal) -> Decimal:
+    # VR-008 — shared by every request schema that creates/edits a DividendTranche.
+    if value <= 0:
+        raise ValueError("Dividend per share must be greater than zero")
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -6:
+        raise ValueError("Dividend per share can have at most 6 decimal places")
+    return value
+
+
+def _check_dividend_payment_date(value: date) -> date:
+    # VR-009
+    if value > date.today() + timedelta(days=30):
+        raise ValueError("Payment date cannot be more than 30 days in the future")
+    return value
+
+
 class BrokerConfigResponse(BaseModel):
     """Matches components/schemas/BrokerConfigResponse in
     03-openapi-specification.md exactly."""
@@ -227,34 +250,77 @@ class CreateDividendRequest(BaseModel):
     @field_validator("tranche_label")
     @classmethod
     def validate_tranche_label(cls, value: str) -> str:
-        if value not in _TRANCHE_LABELS:
-            raise ValueError(f"tranche_label must be one of {_TRANCHE_LABELS}")
-        return value
+        return _check_tranche_label(value)
 
     @field_validator("per_share_amount")
     @classmethod
     def validate_per_share_amount(cls, value: Decimal) -> Decimal:
-        # VR-008
-        if value <= 0:
-            raise ValueError("Dividend per share must be greater than zero")
-        exponent = value.as_tuple().exponent
-        if isinstance(exponent, int) and exponent < -6:
-            raise ValueError("Dividend per share can have at most 6 decimal places")
-        return value
+        return _check_per_share_amount(value)
 
     @field_validator("payment_date")
     @classmethod
     def validate_payment_date(cls, value: date) -> date:
-        # VR-009
-        if value > date.today() + timedelta(days=30):
-            raise ValueError("Payment date cannot be more than 30 days in the future")
-        return value
+        return _check_dividend_payment_date(value)
 
     @model_validator(mode="after")
     def validate_ex_dividend_date(self) -> "CreateDividendRequest":
         # VR-010
         if self.ex_dividend_date is not None and self.ex_dividend_date > self.payment_date:
             raise ValueError("Ex-dividend date must be before or on the payment date")
+        return self
+
+
+class UpdateDividendRequest(BaseModel):
+    """Matches components/schemas/UpdateDividendRequest in
+    03-openapi-specification.md. At least one of per_share_amount/
+    qualifying_shares/tranche_label/payment_date/ex_dividend_date must be
+    present in addition to `version`. Field-shape checks (VR-008/009) happen
+    here; checks that need the tranche's *existing* stored values merged in
+    (VR-010's ex_dividend_date-vs-payment_date, VR-011's qualifying_shares
+    bound, BR-014's per-year cap, the duplicate-label rule) happen in the
+    service layer against the merged result, same pattern as UpdateLotRequest.
+
+    `ex_dividend_date: None` is indistinguishable from "not provided" here —
+    there is no way to explicitly clear an already-set ex_dividend_date via
+    this endpoint. Not spec-mandated either way; a minor known limitation
+    rather than a sentinel-value workaround for an edge case no story covers.
+    """
+
+    per_share_amount: Decimal | None = None
+    qualifying_shares: int | None = Field(None, ge=1)
+    tranche_label: str | None = None
+    payment_date: date | None = None
+    ex_dividend_date: date | None = None
+    version: int = Field(..., ge=1)
+
+    @field_validator("per_share_amount")
+    @classmethod
+    def validate_per_share_amount(cls, value: Decimal | None) -> Decimal | None:
+        return _check_per_share_amount(value) if value is not None else value
+
+    @field_validator("tranche_label")
+    @classmethod
+    def validate_tranche_label(cls, value: str | None) -> str | None:
+        return _check_tranche_label(value) if value is not None else value
+
+    @field_validator("payment_date")
+    @classmethod
+    def validate_payment_date(cls, value: date | None) -> date | None:
+        return _check_dividend_payment_date(value) if value is not None else value
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self) -> "UpdateDividendRequest":
+        if (
+            self.per_share_amount is None
+            and self.qualifying_shares is None
+            and self.tranche_label is None
+            and self.payment_date is None
+            and self.ex_dividend_date is None
+        ):
+            raise ValueError(
+                "At least one of per_share_amount, qualifying_shares, tranche_label, "
+                "payment_date, or ex_dividend_date must be provided"
+            )
         return self
 
 

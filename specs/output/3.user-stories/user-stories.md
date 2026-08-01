@@ -1172,15 +1172,15 @@ Then total_amount recalculates to 0.22 × 5000 = 1100.00 using the EXISTING stor
 
 **Acceptance Criteria**
 
-- [ ] Editing `per_share_amount` recomputes `total_amount` using the tranche's own stored `qualifying_shares`, never the current position total (BAS US-012)
-- [ ] Editing `qualifying_shares` directly recomputes `total_amount` with the new qualifying_shares × the existing `per_share_amount`; still bounded ≤ position_total_shares at time of edit (VR-011 "on edit" clause)
-- [ ] Delete is a soft-delete; position/portfolio yield recalculates with the tranche excluded
-- [ ] Optimistic locking via `version` column, identical conflict handling to BE-2.3 (EX-008)
-- [ ] `audit_log` entries `DIVIDEND_UPDATED` / `DIVIDEND_DELETED` capture previous and new values
+- [x] Editing `per_share_amount` recomputes `total_amount` using the tranche's own stored `qualifying_shares`, never the current position total (BAS US-012)
+- [x] Editing `qualifying_shares` directly recomputes `total_amount` with the new qualifying_shares × the existing `per_share_amount`; still bounded ≤ position_total_shares at time of edit (VR-011 "on edit" clause) — exact BAS error copy including comma-formatted thousands, e.g. "(5,000)"
+- [x] Delete is a soft-delete; position/portfolio dividend income YTD recalculates with the tranche excluded (no separate "yield" recalculation needed server-side — see BE-3.1's Implementation Record on why the backend never computes yield% at all)
+- [x] Optimistic locking via `version` column, identical conflict handling to BE-2.3 (EX-008) — same error code/message
+- [x] `audit_log` entries `DIVIDEND_UPDATED` / `DIVIDEND_DELETED` capture previous and new values
 
 **Definition of Done**
 
-- [ ] Both BAS US-012 Gherkin scenarios (edit per_share_amount, edit qualifying_shares) pass as automated tests with the exact numeric expectations
+- [x] Both BAS US-012 Gherkin scenarios (edit per_share_amount, edit qualifying_shares) pass as automated tests with the exact numeric expectations (RM1,100.00 and RM600.00 respectively), plus the error scenario with the exact required error copy
 
 **Dependencies & Integrations**
 
@@ -1189,6 +1189,35 @@ Then total_amount recalculates to 0.22 × 5000 = 1100.00 using the EXISTING stor
 **Technical Constraints**
 
 - Same NUMERIC/Decimal constraints as BE-3.1
+
+---
+
+### Implementation Record — BE-3.2
+
+**What was actually built**
+
+- `app/portfolio/schemas.py` — `UpdateDividendRequest` (all fields optional except `version`; "at least one field" model validator, matching `UpdateLotRequest`'s shape exactly). Refactored BE-3.1's inline VR-008/009 field validators into shared module-level functions (`_check_tranche_label`, `_check_per_share_amount`, `_check_dividend_payment_date`) so create and edit can never drift, same pattern already used for Lots.
+- `app/portfolio/service.py` — `get_owned_dividend_tranche` (ownership joins through the tranche's own Position, since `/dividends/{id}` isn't nested under a position_id in the URL, unlike Lots), `update_dividend_tranche` (conditional `UPDATE ... WHERE id=? AND version=?`, merges each optional field against the tranche's existing stored value before recomputing `total_amount`), `delete_dividend_tranche`. Extracted `_check_qualifying_shares_bound` and `_check_tranche_year_constraints` out of BE-3.1's `create_dividend_tranche` so both BR-014's cap and the duplicate-label rule are re-validated identically on edit, excluding the tranche being edited from its own count/uniqueness check.
+- `app/portfolio/router.py` — `PATCH /api/v1/portfolio/dividends/{id}`, `DELETE /api/v1/portfolio/dividends/{id}`.
+- `alembic/versions/0010_extend_audit_log_for_dividend_edit_delete.py` — `DIVIDEND_UPDATED`/`DIVIDEND_DELETED` added to `audit_log`'s CHECK constraint.
+- **Fixed a minor copy bug found while implementing this story**: BE-3.1's `qualifying_shares` error message used plain `{position_total_shares}` interpolation (e.g. "(5000)"), but BAS's own example shows comma-formatted thousands ("(5,000)"). Fixed with `{position_total_shares:,}` in both the create and edit paths.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **Moving a tranche's `payment_date` into a different calendar year re-validates BR-014's 8-per-year cap and the duplicate-label rule against the *new* year, excluding the tranche's own row from the count.** Not explicitly called out in the AC, but a direct consequence of `payment_date` (and therefore `year`) being editable per the OpenAPI `UpdateDividendRequest` schema — an edit that moves a tranche into an already-full year must be rejected the same way a create into a full year is; an edit that only changes the *day* within the same year must not accidentally count itself twice. Both directions are tested.
+2. **`ex_dividend_date: null` in a PATCH body is indistinguishable from "field omitted"** — there is no way to explicitly clear an already-set `ex_dividend_date` via this endpoint (documented on `UpdateDividendRequest` itself). Not spec-mandated either way; a minor known limitation rather than adding sentinel-value/`exclude_unset` complexity for an edge case no story covers.
+
+**Test evidence**
+
+- `uv run pytest`: 163/163 passing (144 pre-existing + 19 new): both BAS US-012 numeric scenarios exactly (RM1,100.00 / RM600.00), the exact error copy with comma formatting, version-conflict 409 (stale PATCH after a successful one), empty-body rejection, 404 ownership (nonexistent/foreign tranche, auth requirement), BR-014 re-validation when moving years (both the "now over cap" rejection and the "moving within the same year doesn't double-count itself" acceptance), duplicate-label rejection on edit, VR-010 re-validation, `DIVIDEND_UPDATED` audit log with previous/new values, delete 204 + soft-delete flags, delete correctly excludes the tranche from position/dashboard income on the next read, 404 ownership on delete, `DIVIDEND_DELETED` audit log.
+- Migration 0010 applied and rolled back cleanly against the real Postgres container.
+- Live smoke test against the real backend + Postgres: logged a dividend, ran both BAS US-012 edits in sequence against the real server (confirming version increments 1→2→3 and each recalculation), triggered the qualifying-shares-exceeded error and confirmed the exact comma-formatted copy, then deleted the tranche and confirmed the position's `total_dividend_income_ytd` correctly dropped to "0.00".
+- `npm run build` (frontend): clean — no frontend changes were needed for this story (no FE-3.x UI exists yet).
+
+**Known gaps / not yet verified**
+
+- No live browser interaction (no FE-3.x work exists yet — that's FE-3.2's own story).
+- `ex_dividend_date` cannot be explicitly cleared once set (Deviation 2).
 
 ---
 

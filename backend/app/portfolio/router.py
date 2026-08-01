@@ -21,6 +21,7 @@ from app.portfolio.schemas import (
     PortfolioResponse,
     PositionResponse,
     PositionSummaryResponse,
+    UpdateDividendRequest,
     UpdateLotRequest,
     UpdatePositionRequest,
 )
@@ -28,6 +29,7 @@ from app.portfolio.service import (
     add_lot_to_position,
     create_dividend_tranche,
     create_position,
+    delete_dividend_tranche,
     delete_lot,
     delete_position,
     get_owned_active_position,
@@ -38,6 +40,7 @@ from app.portfolio.service import (
     list_positions_for_portfolio,
     position_aggregates,
     position_dividend_income_ytd,
+    update_dividend_tranche,
     update_lot,
     update_position_metadata,
 )
@@ -281,3 +284,29 @@ async def add_dividend(
     portfolio = await get_portfolio_for_user(db, current_user.id)
     tranche = await create_dividend_tranche(db, current_user.id, portfolio.id, body)
     return DividendTrancheResponse.model_validate(tranche)
+
+
+@router.patch("/portfolio/dividends/{tranche_id}", response_model=DividendTrancheResponse)
+@limiter.limit("60/minute")
+async def patch_dividend(
+    request: Request,
+    tranche_id: UUID,
+    body: UpdateDividendRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DividendTrancheResponse:
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    tranche = await update_dividend_tranche(db, current_user.id, portfolio.id, tranche_id, body)
+    return DividendTrancheResponse.model_validate(tranche)
+
+
+@router.delete("/portfolio/dividends/{tranche_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("60/minute")
+async def delete_dividend_endpoint(
+    request: Request,
+    tranche_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    await delete_dividend_tranche(db, current_user.id, portfolio.id, tranche_id)

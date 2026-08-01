@@ -25,6 +25,8 @@ AUDIT_LOG_ACTIONS = (
     "POSITION_UPDATED",
     "POSITION_DELETED",
     "DIVIDEND_CREATED",
+    "DIVIDEND_UPDATED",
+    "DIVIDEND_DELETED",
 )
 
 AUDIT_LOG_ENTITY_TYPES = ("User", "Lot", "Position", "DividendTranche")
