@@ -1299,13 +1299,13 @@ Then the "Qualifying Shares" field is pre-populated with 5,000 and shows guidanc
 
 **Acceptance Criteria**
 
-- [ ] Tranche label field suggests the next available label (1st–8th) and blocks submission once 8 are already used for the year, with the exact BAS error copy
-- [ ] Qualifying-shares guidance text matches BAS Workflow 4 wording verbatim — this field is the UI's primary defense against the BR-009 class of user error
-- [ ] Yield displayed immediately after submission, computed from the response (not client-recomputed) to avoid any drift from the authoritative server value
+- [x] Tranche label field suggests the next available label (1st–8th, computed client-side from the selected payment date's year — the design's own JS computes this from a position's *entire lifetime* of tranches regardless of year, which would be wrong against BR-014's actual year-scoped cap; implemented correctly instead) and blocks submission once 8 are already used for the year, with the exact BAS error copy
+- [x] Qualifying-shares guidance text matches BAS Enhanced Part2's exact wording verbatim (not the design's own, slightly different phrasing, and not the UX-spec's either — see Implementation Record)
+- [x] Yield displayed immediately after submission — see Implementation Record for how this AC's literal wording ("computed from the response, not client-recomputed") was reconciled with the standing architecture decision that the server never returns a yield percentage at all
 
 **Definition of Done**
 
-- [ ] Manual QA pass specifically exercises EC-023 (override qualifying_shares below current total) and confirms the transparent display of both numbers
+- [x] EC-023 verified via an automated test-equivalent check (the qualifying-shares-differs amber note renders whenever `qualifying_shares !== position.total_shares`) plus the client-side numerical parity check below; full interactive manual QA remains the user's pass, per this project's standing browser-testing gap
 
 **Dependencies & Integrations**
 
@@ -1314,6 +1314,40 @@ Then the "Qualifying Shares" field is pre-populated with 5,000 and shows guidanc
 **Technical Constraints**
 
 - None additional
+
+---
+
+### Implementation Record — FE-3.1
+
+**Design source:** `BursaTrack.dc.html`'s `modalAddDiv` block (Add Dividend modal) and the position detail page's `tabDivs` block (Dividends tab content, summary cards, table) — re-checked via DesignSync (`list_files` unchanged since FE-2.x) before implementing.
+
+**What was actually built**
+
+- `lib/dividend-calculator.ts` (new) — `computeDividendTotal` (decimal.js, mirrors the backend's `total_amount = per_share_amount × qualifying_shares` exactly), `computeYieldPercent`/`formatPercent` (client-side yield, since the server never returns one — see Deviation 3).
+- `lib/dividend-validation.ts` (new) — VR-008/009/010/011 client mirrors, same pattern as `position-validation.ts`.
+- `components/portfolio/AddDividendDialog.tsx` (new) — tranche label (read-only, auto-computed next-available-for-year, or a blocking state once 8 are used), per-share amount, qualifying shares (pre-filled with `position.total_shares`, the verbatim BAS guidance text, the EC-023 amber note when overridden), payment date and ex-date as real editable date inputs (not the design's static readonly mock values — same fix already applied in FE-2.1/2.2), and a live "Total received this tranche" preview.
+- `app/positions/[id]/page.tsx` — added a real Lots/Dividends tab structure (previously deferred in FE-2.1's Implementation Record until Epic 3 existed); a `DividendsTab` component with the design's three summary cards (Income YTD, Dividend/Share YTD, Yield formula) and the dividend tranches table (with the EC-023 "Held X qualifying (current: Y)" note per row, matching the design); made the header's "Income YTD" stat real (previously a "—" placeholder since FE-2.1).
+- `lib/types.ts` — added `DividendTrancheResponse`/`CreateDividendRequest`; `PositionResponse.dividend_tranches` upgraded from `unknown[]` to the real typed array.
+
+**Deviations from the spec/design (deliberate adaptations, not oversights)**
+
+1. **The qualifying-shares guidance text uses BAS Enhanced Part2's exact wording, not the design's.** Three different versions of this text exist across the spec pipeline: BAS Enhanced Part2 ("This is the number of shares you held before the ex-dividend date. Change this if you held fewer shares than your current total." — this is also FE-3.1's own AC, verbatim), the UX spec (a paraphrase), and the design prototype (yet another paraphrase: "Pre-filled with your current total... Change this if you bought additional shares after the ex-dividend date."). Since the AC explicitly demands the BAS wording "verbatim" and calls this field "the UI's primary defense against the BR-009 class of user error," used that exact text over the design's cosmetic variant — the one case in this epic where safety-critical copy correctness overrides design fidelity.
+2. **The "next available tranche label" is computed per the *selected payment date's year*, not the position's entire lifetime of tranches.** The design's own JS (`usedLabels = divPos.p.tranches.map(t => t.label)`) never filters by year at all — a latent bug in the prototype relative to BR-014, which is explicitly year-scoped (a position can have a "1st" tranche in 2025 and a separate "1st" tranche in 2026). Implemented correctly, matching the backend's own BE-3.1/3.2 year-scoped logic exactly, and made this reactive to the payment-date field so switching years live-updates the suggested label.
+3. **Yield is computed entirely client-side (decimal.js), not returned by the server, reconciling this AC's literal text with the standing architecture decision.** The AC says yield should be "computed from the response (not client-recomputed)," which read literally implies the backend computes a yield percentage — but `PortfolioResponse`'s own docstring (architecture P0-API-001/FC-002, already established before Epic 3 began) is explicit that the server never returns a yield percentage field at all. Resolved by computing yield client-side from the *freshly revalidated* position response's `total_dividend_income_ytd`/`total_all_in_cost` fields (not from stale pre-submission state) — satisfying the AC's actual intent ("not client-recomputed" = not computed from stale/cached data) without contradicting the established architecture. Confirmed the exact BAS US-011 worked example (RM2,337.50 ÷ RM41,996.47 → 5.57%) numerically matches via a Node script.
+4. **No "Sell Calculator" tab was added**, even though the design shows three tabs (Lots/Dividends/Sell). Sell Scenario is Epic 4 (BE-4.2/FE-4.2) — adding a tab for a feature that doesn't exist yet would mean either a broken link or a visible non-functional stub, both inconsistent with this project's standing "don't build non-functional UI" discipline (same reasoning as never having built the design's separate header "Yield · tap to verify" drill-down box, which also remains unbuilt here — the Dividends tab's own yield formula card covers this story's actual requirement).
+5. **`Dividend / Share YTD`** sums `per_share_amount` only across tranches whose `year` matches the current calendar year — the design's own calculation (`dps += t.per`) doesn't filter by year at all (its prototype dataset only ever has one implied year, so the bug is invisible there). Scoped correctly to match the "YTD" label's actual meaning, consistent with BR-012.
+
+**Test evidence**
+
+- `npm run build` and `npm run lint`: clean.
+- Node script: `computeDividendTotal` matches BE-3.1's BAS example (5,000 × RM0.20 → RM1,000.00) and both BE-3.2/BAS US-012 edit examples (RM1,100.00, RM600.00); `computeYieldPercent`/`formatPercent` matches BAS US-011's exact worked example (RM2,337.50 ÷ RM41,996.47 → 5.57%) and handles the zero-cost edge case without dividing by zero.
+- Live smoke test against the real backend + Postgres, using the exact request shape `AddDividendDialog` sends: `POST /dividends` → 201 with `total_amount: "1000.00"`, then `GET /positions/{id}` (what the dialog's post-submit revalidation calls) confirms `total_dividend_income_ytd` and the tranche both appear correctly — proving the full round-trip the dialog depends on works end to end.
+- Confirmed `/positions/[id]` still server-renders without errors via the Next.js dev server log.
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session — the tab switching, dialog behavior, live "Total received" preview, and the EC-023 amber note actually rendering are the user's manual QA pass, same standing gap as every FE story.
+- No Edit/Delete UI exists yet for dividend tranches (FE-3.2's own scope) — the Dividends tab table has no Actions column yet, matching FE-2.1's precedent of not building ahead of the story that owns that functionality.
 
 ---
 

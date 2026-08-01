@@ -6,6 +6,7 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 
 import { AuthGate } from "@/components/auth/AuthGate";
+import { AddDividendDialog } from "@/components/portfolio/AddDividendDialog";
 import { AddLotDialog } from "@/components/portfolio/AddLotDialog";
 import { EditLotDialog } from "@/components/portfolio/EditLotDialog";
 import { ConfirmDialog } from "@/components/shared/ConfirmDialog";
@@ -14,9 +15,10 @@ import { useBrokers } from "@/hooks/useBrokers";
 import { useDashboard } from "@/hooks/useDashboard";
 import { usePosition } from "@/hooks/usePosition";
 import { apiFetch } from "@/lib/api";
-import { brokerNote } from "@/lib/fee-calculator";
 import { CATEGORY_TAG_STYLES } from "@/lib/category-tags";
-import type { BrokerConfigResponse } from "@/lib/types";
+import { computeYieldPercent, formatPercent } from "@/lib/dividend-calculator";
+import { brokerNote } from "@/lib/fee-calculator";
+import type { BrokerConfigResponse, PositionResponse } from "@/lib/types";
 
 function formatMoney(value: string): string {
   return "RM " + parseFloat(value).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -39,10 +41,12 @@ function PositionDetailContent() {
   const { position, isLoading, error, mutate: revalidatePosition } = usePosition(params.id);
   const { brokers } = useBrokers();
   const { mutate: revalidateDashboard } = useDashboard();
+  const [tab, setTab] = useState<"lots" | "dividends">("lots");
   const [addLotOpen, setAddLotOpen] = useState(false);
   const [editingLotId, setEditingLotId] = useState<string | null>(null);
   const [deletingLotId, setDeletingLotId] = useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [addDividendOpen, setAddDividendOpen] = useState(false);
 
   const [notice, setNotice] = useState<string | null>(searchParams.get("notice"));
 
@@ -78,6 +82,10 @@ function PositionDetailContent() {
     await revalidatePosition();
     await revalidateDashboard();
     setNotice("Lot deleted.");
+  }
+
+  function handleDividendLogged(dividendNotice: string) {
+    setNotice(dividendNotice);
   }
 
   return (
@@ -177,7 +185,9 @@ function PositionDetailContent() {
                   <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Income YTD
                   </div>
-                  <div className="mt-0.5 font-semibold text-muted-foreground">—</div>
+                  <div className="mt-0.5 font-semibold text-[#177A4E]">
+                    {formatMoney(position.total_dividend_income_ytd)}
+                  </div>
                 </div>
                 <div>
                   <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
@@ -188,6 +198,29 @@ function PositionDetailContent() {
               </div>
             </div>
 
+            <div role="tablist" aria-label="Position detail sections" className="mb-5 flex gap-1 border-b border-border">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={tab === "lots"}
+                onClick={() => setTab("lots")}
+                className={`-mb-px border-b-2 px-4 py-2.5 text-sm font-semibold ${tab === "lots" ? "border-primary text-primary" : "border-transparent text-muted-foreground hover:text-foreground"}`}
+              >
+                Lots ({position.lots.length})
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={tab === "dividends"}
+                onClick={() => setTab("dividends")}
+                className={`-mb-px border-b-2 px-4 py-2.5 text-sm font-semibold ${tab === "dividends" ? "border-primary text-primary" : "border-transparent text-muted-foreground hover:text-foreground"}`}
+              >
+                Dividends ({position.dividend_tranches.length})
+              </button>
+            </div>
+
+            {tab === "lots" && (
+              <>
             <div className="mb-3 flex items-center justify-between">
               <div className="text-[15px] font-bold">Lots ({position.lots.length})</div>
               <button
@@ -291,12 +324,31 @@ function PositionDetailContent() {
                 formula
               </div>
             </div>
+              </>
+            )}
+
+            {tab === "dividends" && (
+              <DividendsTab
+                position={position}
+                onAddDividend={() => setAddDividendOpen(true)}
+              />
+            )}
           </>
         )}
       </main>
 
       {position && (
         <AddLotDialog open={addLotOpen} onOpenChange={setAddLotOpen} position={position} onLotAdded={handleLotAdded} />
+      )}
+      {position && (
+        <AddDividendDialog
+          open={addDividendOpen}
+          onOpenChange={setAddDividendOpen}
+          position={position}
+          revalidatePosition={revalidatePosition}
+          revalidateDashboard={revalidateDashboard}
+          onLogged={handleDividendLogged}
+        />
       )}
       {position && editingLot && (
         <EditLotDialog
@@ -333,6 +385,112 @@ function PositionDetailContent() {
         />
       )}
     </div>
+  );
+}
+
+function DividendsTab({ position, onAddDividend }: { position: PositionResponse; onAddDividend: () => void }) {
+  const currentYear = new Date().getFullYear();
+  const tranchesThisYear = position.dividend_tranches.filter((t) => t.year === currentYear);
+  const dividendPerShareYtd = tranchesThisYear.reduce((sum, t) => sum + parseFloat(t.per_share_amount), 0);
+  const yieldPercent = formatPercent(computeYieldPercent(position.total_dividend_income_ytd, position.total_all_in_cost));
+  const formulaS = `${formatMoney(position.total_dividend_income_ytd)} ÷ ${formatMoney(position.total_all_in_cost)} = ${yieldPercent}`;
+
+  return (
+    <>
+      <div className="mb-4 flex flex-wrap gap-3.5">
+        <div className="rounded-[10px] border border-border bg-card px-4.5 py-3">
+          <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">Income YTD</div>
+          <div className="mt-0.5 text-[17px] font-bold text-[#177A4E]">{formatMoney(position.total_dividend_income_ytd)}</div>
+        </div>
+        <div className="rounded-[10px] border border-border bg-card px-4.5 py-3">
+          <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">Dividend / Share YTD</div>
+          <div className="mt-0.5 text-[17px] font-bold">RM {dividendPerShareYtd.toFixed(4)}</div>
+        </div>
+        <div className="flex min-w-[260px] flex-1 items-center justify-between gap-3 rounded-[10px] border border-border bg-card px-4.5 py-3">
+          <div>
+            <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+              Yield = income ÷ all-in cost
+            </div>
+            <div className="mt-0.5 font-mono text-[13px] text-muted-foreground">{formulaS}</div>
+          </div>
+          <button
+            type="button"
+            onClick={onAddDividend}
+            className="cursor-pointer rounded-lg bg-primary px-3.5 py-2 text-[13.5px] font-semibold whitespace-nowrap text-primary-foreground hover:bg-[#2F41C4] focus-visible:outline-2 focus-visible:outline-foreground focus-visible:outline-offset-2"
+          >
+            + Add Dividend
+          </button>
+        </div>
+      </div>
+
+      {tranchesThisYear.length === 0 && position.dividend_tranches.length === 0 ? (
+        <div className="rounded-xl border border-border bg-card p-10 text-center">
+          <h2 className="mb-2 text-base font-bold text-foreground">No dividends logged yet</h2>
+          <p className="mx-auto max-w-md text-sm text-muted-foreground">
+            Log a dividend tranche to start tracking your true income and yield for this position.
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-xl border border-border bg-card">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[860px] border-collapse text-[13.5px]">
+              <thead>
+                <tr className="border-b border-border">
+                  <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                    Tranche
+                  </th>
+                  <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                    Per Share
+                  </th>
+                  <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                    Qualifying Shares
+                  </th>
+                  <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                    Total Received
+                  </th>
+                  <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                    Payment Date
+                  </th>
+                  <th className="px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                    Ex-Date
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {position.dividend_tranches
+                  .slice()
+                  .sort((a, b) => (a.payment_date > b.payment_date ? -1 : 1))
+                  .map((tranche) => {
+                    const qualifyingDiffers = tranche.qualifying_shares !== position.total_shares;
+                    return (
+                      <tr key={tranche.id} className="border-b border-[#F0F0ED] last:border-0 hover:bg-[#FAFAF8]">
+                        <td className="px-3.5 py-3 font-semibold">{tranche.tranche_label}</td>
+                        <td className="px-3.5 py-3 text-right">RM {parseFloat(tranche.per_share_amount).toFixed(4)}</td>
+                        <td className="px-3.5 py-3 text-right">
+                          <span>{formatShares(tranche.qualifying_shares)}</span>
+                          {qualifyingDiffers && (
+                            <div className="mt-0.5 text-[11.5px] text-[#8A5A00]">
+                              Held {formatShares(tranche.qualifying_shares)} qualifying (current:{" "}
+                              {formatShares(position.total_shares)})
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-3.5 py-3 text-right font-semibold text-[#177A4E]">
+                          {formatMoney(tranche.total_amount)}
+                        </td>
+                        <td className="px-3.5 py-3">{formatDate(tranche.payment_date)}</td>
+                        <td className="px-3.5 py-3 text-muted-foreground">
+                          {tranche.ex_dividend_date ? formatDate(tranche.ex_dividend_date) : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

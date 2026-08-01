@@ -82,10 +82,36 @@ export interface PositionSummaryResponse {
   unrealised_pnl: string | null;
 }
 
+export type DividendTrancheLabel = "1st" | "2nd" | "3rd" | "4th" | "5th" | "6th" | "7th" | "8th";
+
+export interface CreateDividendRequest {
+  position_id: string;
+  tranche_label: DividendTrancheLabel;
+  per_share_amount: string;
+  qualifying_shares: number;
+  payment_date: string;
+  ex_dividend_date?: string | null;
+}
+
+export interface DividendTrancheResponse {
+  id: string;
+  position_id: string;
+  tranche_label: DividendTrancheLabel;
+  per_share_amount: string;
+  qualifying_shares: number;
+  total_amount: string;
+  payment_date: string;
+  ex_dividend_date: string | null;
+  year: number;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface PositionResponse extends PositionSummaryResponse {
   notes: string | null;
   lots: LotResponse[];
-  dividend_tranches: unknown[];
+  dividend_tranches: DividendTrancheResponse[];
   is_deleted: boolean;
   created_at: string;
   updated_at: string;
