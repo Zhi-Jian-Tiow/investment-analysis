@@ -34,3 +34,67 @@ export interface BrokerConfigResponse {
 export interface BrokerListResponse {
   brokers: BrokerConfigResponse[];
 }
+
+export type CategoryTag = "Dividend" | "Volatile" | "Growth";
+
+export interface CreatePositionRequest {
+  stock_code: string;
+  stock_name: string;
+  shares: number;
+  purchase_price: string;
+  broker_id: string;
+  purchase_date: string;
+  category_tag: CategoryTag;
+  notes?: string | null;
+}
+
+export interface LotResponse {
+  id: string;
+  position_id: string;
+  shares: number;
+  purchase_price: string;
+  purchase_date: string;
+  broker_id: string;
+  initial_amount: string;
+  brokerage_fee: string;
+  clearing_fee: string;
+  stamp_duty: string;
+  all_in_cost: string;
+  version: number;
+  created_at: string;
+  updated_at: string;
+  warnings: string[];
+}
+
+export interface PositionSummaryResponse {
+  id: string;
+  stock_code: string;
+  stock_name: string;
+  category_tag: CategoryTag;
+  total_shares: number;
+  total_all_in_cost: string;
+  blended_purchase_price: string;
+  total_dividend_income_ytd: string;
+  current_price: string | null;
+  price_source: "automated" | "manual" | "stale" | null;
+  price_last_refreshed_at: string | null;
+  current_market_value: string | null;
+  unrealised_pnl: string | null;
+}
+
+export interface PositionResponse extends PositionSummaryResponse {
+  notes: string | null;
+  lots: LotResponse[];
+  dividend_tranches: unknown[];
+  is_deleted: boolean;
+  created_at: string;
+  updated_at: string;
+  warnings: string[];
+}
+
+export interface PortfolioResponse {
+  total_all_in_cost: string;
+  total_dividend_income_ytd: string;
+  last_price_refresh_at: string | null;
+  positions: PositionSummaryResponse[];
+}

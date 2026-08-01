@@ -207,6 +207,48 @@ class LotResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class PositionSummaryResponse(BaseModel):
+    """Matches components/schemas/PositionSummaryResponse in
+    03-openapi-specification.md — the list-row shape used by
+    GET /api/v1/portfolio/dashboard (no lots/dividend_tranches; see
+    PositionResponse for the full detail shape). Same later-epic-dependent
+    fields held at their documented-nullable defaults as PositionResponse.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    stock_code: str
+    stock_name: str
+    category_tag: str
+    total_shares: int
+    total_all_in_cost: Decimal
+    blended_purchase_price: Decimal
+    total_dividend_income_ytd: Decimal = Decimal("0.00")
+    current_price: Decimal | None = None
+    price_source: str | None = None
+    price_last_refreshed_at: datetime | None = None
+    current_market_value: Decimal | None = None
+    unrealised_pnl: Decimal | None = None
+
+
+class PortfolioResponse(BaseModel):
+    """Matches components/schemas/PortfolioResponse in
+    03-openapi-specification.md. This is documented as the Epic 4 (BE-4.1)
+    dashboard endpoint, but a minimal slice of it is pulled forward here
+    (FE-2.1) because it's the only spec-documented way to list a user's
+    positions — there is no separate "list positions" endpoint. Aggregates
+    that depend on unbuilt epics (dividend income, price refresh timestamp)
+    are held at their documented-nullable/zero defaults, same pattern as
+    PositionResponse.
+    """
+
+    total_all_in_cost: Decimal
+    total_dividend_income_ytd: Decimal = Decimal("0.00")
+    last_price_refresh_at: datetime | None = None
+    positions: list[PositionSummaryResponse]
+
+
 class PositionResponse(BaseModel):
     """Matches components/schemas/PositionResponse (via PositionSummaryResponse)
     in 03-openapi-specification.md, with fields that depend on later epics

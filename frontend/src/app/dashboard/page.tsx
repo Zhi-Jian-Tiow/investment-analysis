@@ -1,20 +1,35 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
 
 import { AuthGate } from "@/components/auth/AuthGate";
 import { VerifyBanner } from "@/components/dashboard/VerifyBanner";
+import { AddPositionDialog } from "@/components/portfolio/AddPositionDialog";
+import { Button } from "@/components/ui/button";
+import { useDashboard } from "@/hooks/useDashboard";
 import { useAuth } from "@/lib/auth-context";
 
-/**
- * Minimal stub — the real portfolio dashboard is Epic 4 (BE-4.1/FE-4.1).
- * This page exists so FE-1.1's "redirected to the dashboard with a
- * persistent banner" AC has somewhere real to land.
- */
+function formatMoney(value: string): string {
+  return "RM " + parseFloat(value).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatShares(value: number): string {
+  return value.toLocaleString("en-MY");
+}
+
+const TAG_STYLES: Record<string, string> = {
+  Dividend: "bg-[#E7F5EE] text-[#177A4E]",
+  Volatile: "bg-secondary text-secondary-foreground",
+  Growth: "bg-accent text-accent-foreground",
+};
+
 function DashboardContent() {
   const { user, logout } = useAuth();
   const router = useRouter();
+  const { portfolio, positions, isLoading } = useDashboard();
+  const [addPositionOpen, setAddPositionOpen] = useState(false);
 
   if (!user) return null; // AuthGate guarantees this, but keeps TS happy
 
@@ -46,16 +61,100 @@ function DashboardContent() {
       <main className="mx-auto max-w-[1200px] px-6 py-6">
         {!user.email_verified && <VerifyBanner />}
 
-        <div className="rounded-xl border border-border bg-card p-10 text-center">
-          <h1 className="mb-2 text-xl font-bold tracking-tight text-foreground">Welcome to BursaTrack</h1>
-          <p className="mx-auto max-w-md text-sm text-muted-foreground">
-            You&apos;re signed in as <span className="font-medium text-foreground">{user.email}</span>. The
-            portfolio dashboard — adding positions, tracking dividends, yield — is built in Epic 2 through 4.
-            This page confirms registration, email verification, login, and session handling are fully
-            working end to end.
-          </p>
+        <div className="mb-4.5 flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <h1 className="m-0 text-[22px] font-bold tracking-tight text-foreground">Portfolio</h1>
+            <div className="mt-1 text-[13px] text-muted-foreground">
+              {portfolio ? `${positions.length} position${positions.length === 1 ? "" : "s"}` : "Loading…"}
+            </div>
+          </div>
+          <Button onClick={() => setAddPositionOpen(true)}>+ Add Position</Button>
         </div>
+
+        {isLoading && (
+          <div className="rounded-xl border border-border bg-card p-10 text-center text-sm text-muted-foreground">
+            Loading portfolio…
+          </div>
+        )}
+
+        {!isLoading && positions.length === 0 && (
+          <div className="rounded-xl border border-border bg-card p-10 text-center">
+            <h2 className="mb-2 text-lg font-bold tracking-tight text-foreground">No positions yet</h2>
+            <p className="mx-auto max-w-md text-sm text-muted-foreground">
+              Add your first position to start tracking your true all-in cost and dividend income.
+            </p>
+          </div>
+        )}
+
+        {!isLoading && positions.length > 0 && (
+          <div className="rounded-xl border border-border bg-card">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[860px] border-collapse text-[13.5px]">
+                <thead>
+                  <tr className="border-b border-border">
+                    <th className="px-3.5 py-3 text-left text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Stock
+                    </th>
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Shares
+                    </th>
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Blended Price
+                    </th>
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      All-In Cost
+                    </th>
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Current Price
+                    </th>
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Income YTD
+                    </th>
+                    <th className="px-3.5 py-3 text-right text-[11.5px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Yield
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {positions.map((position) => (
+                    <tr key={position.id} className="border-b border-[#F0F0ED] last:border-0">
+                      <td className="px-3.5 py-3">
+                        <Link
+                          href={`/positions/${position.id}`}
+                          className="flex items-center gap-2.5 text-foreground hover:no-underline"
+                        >
+                          <div>
+                            <div className="font-semibold text-foreground">{position.stock_name}</div>
+                            <div className="font-mono text-[11.5px] text-muted-foreground">
+                              {position.stock_code}
+                            </div>
+                          </div>
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${TAG_STYLES[position.category_tag] ?? TAG_STYLES.Dividend}`}
+                          >
+                            {position.category_tag}
+                          </span>
+                        </Link>
+                      </td>
+                      <td className="px-3.5 py-3 text-right">{formatShares(position.total_shares)}</td>
+                      <td className="px-3.5 py-3 text-right">{formatMoney(position.blended_purchase_price)}</td>
+                      <td className="px-3.5 py-3 text-right">{formatMoney(position.total_all_in_cost)}</td>
+                      <td className="px-3.5 py-3 text-right text-muted-foreground">—</td>
+                      <td className="px-3.5 py-3 text-right text-muted-foreground">—</td>
+                      <td className="px-3.5 py-3 text-right text-muted-foreground">—</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="border-t border-[#F0F0ED] bg-[#FAFAF8] px-3.5 py-2.5 font-mono text-xs text-muted-foreground">
+              Current price, income, and yield require the price-feed and dividend features (later epics).
+            </div>
+          </div>
+        )}
       </main>
+
+      <AddPositionDialog open={addPositionOpen} onOpenChange={setAddPositionOpen} />
     </div>
   );
 }

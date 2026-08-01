@@ -1,3 +1,4 @@
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, status
@@ -15,7 +16,9 @@ from app.portfolio.schemas import (
     CreateLotRequest,
     CreatePositionRequest,
     LotResponse,
+    PortfolioResponse,
     PositionResponse,
+    PositionSummaryResponse,
     UpdateLotRequest,
     UpdatePositionRequest,
 )
@@ -27,6 +30,7 @@ from app.portfolio.service import (
     get_portfolio_for_user,
     get_position_lots,
     list_brokers,
+    list_positions_for_portfolio,
     position_aggregates,
     update_lot,
     update_position_metadata,
@@ -69,6 +73,42 @@ async def get_brokers(
     return BrokerListResponse(
         brokers=[BrokerConfigResponse.model_validate(b) for b in brokers]
     )
+
+
+@router.get("/portfolio/dashboard", response_model=PortfolioResponse)
+@limiter.limit("60/minute")
+async def get_dashboard(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PortfolioResponse:
+    """A minimal slice of the Epic 4 (BE-4.1) dashboard endpoint, pulled
+    forward for FE-2.1: it's the only spec-documented way to list a user's
+    positions. Dividend income and price-refresh fields stay at their
+    documented-nullable/zero defaults until Epic 3/the price-feed epic exist.
+    """
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    positions = await list_positions_for_portfolio(db, portfolio.id)
+
+    summaries: list[PositionSummaryResponse] = []
+    total_all_in_cost = Decimal("0.00")
+    for position in positions:
+        lots = await get_position_lots(db, position.id)
+        total_shares, position_all_in_cost, blended_purchase_price = position_aggregates(lots)
+        total_all_in_cost += position_all_in_cost
+        summaries.append(
+            PositionSummaryResponse(
+                id=position.id,
+                stock_code=position.stock_code,
+                stock_name=position.stock_name,
+                category_tag=position.category_tag,
+                total_shares=total_shares,
+                total_all_in_cost=position_all_in_cost,
+                blended_purchase_price=blended_purchase_price,
+            )
+        )
+
+    return PortfolioResponse(total_all_in_cost=total_all_in_cost, positions=summaries)
 
 
 @router.post(

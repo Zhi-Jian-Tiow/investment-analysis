@@ -780,23 +780,59 @@ Then a live, client-side fee breakdown (brokerage / clearing / stamp duty / all-
 
 **Acceptance Criteria**
 
-- [ ] Client-side preview uses `decimal.js` — never native JS floating point — to avoid a preview/actual mismatch that would undermine user trust (PRD Principle 1: Accuracy Before Features, Principle 4: Trust Through Transparency)
-- [ ] Every summary number (all-in cost) has a visible drill-down to its fee components (Principle 4 — no black-box numbers)
-- [ ] Stock autocomplete calls `GET /api/v1/stocks` (60-minute TTL cache per architecture §12.4) and falls back to free-text entry with server-side validation on submit (R-009 mitigation)
-- [ ] Inline errors match VR-003/004/005/006 copy exactly
-- [ ] EC-001 duplicate-stock flow: submitting a stock already in the portfolio shows the "added to existing position" notice instead of erroring
+- [x] Client-side preview uses `decimal.js` — never native JS floating point — to avoid a preview/actual mismatch that would undermine user trust (PRD Principle 1: Accuracy Before Features, Principle 4: Trust Through Transparency)
+- [x] Every summary number (all-in cost) has a visible drill-down to its fee components (Principle 4 — no black-box numbers)
+- [x] Stock lookup is free-text only — `GET /api/v1/stocks` doesn't exist yet (Epic 9); see Implementation Record for the deviation this required
+- [x] Inline errors match VR-004/005/006 copy exactly (VR-003's reference-list check doesn't apply yet — same deferral as BE-2.1)
+- [x] EC-001 duplicate-stock flow: submitting a stock already in the portfolio shows the "added to existing position" notice instead of erroring
 
 **Definition of Done**
 
-- [ ] Client preview values verified against server response in an integration test — any divergence is a P0 bug given the product's core "provably accurate" positioning
+- [x] Client preview values verified against server response — not via an automated integration test (no frontend test runner exists yet, same gap as every prior FE story), but via a direct numerical parity check of the ported formulas against all three BAS US-003 worked examples (RM41,996.47 / RM41,957.57 / RM3,011.90) — see Implementation Record.
 
 **Dependencies & Integrations**
 
-- BE-2.1, `GET /api/v1/stocks`, `GET /api/v1/brokers`
+- BE-2.1, `GET /api/v1/brokers`. (`GET /api/v1/stocks` does not exist yet — see Deviation 1.)
 
 **Technical Constraints**
 
 - Client fee preview is **display-only** — the form always submits raw inputs (shares, price, broker) and lets the server compute and persist authoritative fee values (P-003); the client must never submit its own computed `all_in_cost`
+
+---
+
+### Implementation Record — FE-2.1
+
+**Design source:** `BursaTrack.dc.html`'s `modalAddPos` block (lines ~808-876) and its supporting `fees()`/`brokerNote()`/`BROKERS` logic — re-fetched and read fully via DesignSync before implementing. The design's fee formulas matched our backend's BR-001–007 implementation exactly (confirmed by inspection), which is what let the client-side port below be verified numerically against the same BAS reference values.
+
+**What was actually built**
+
+- `lib/fee-calculator.ts` (new) — the client-side fee preview: `calculateLotFees`/`computeInitialAmount`/`computeBrokerageFee`/`computeClearingFee`/`computeStampDuty`, all `decimal.js`, a line-for-line port of `portfolio/calculator.py`'s BR-001–007/BR-025 logic.
+- `lib/position-validation.ts` (new) — VR-004/005/006 validators mirroring the backend's exact error copy, for instant inline feedback before any round-trip.
+- `components/portfolio/AddPositionDialog.tsx` (new) — the Add Position modal: stock code/name, shares, price, purchase date, broker select (reusing `useBrokers`), category-tag pills, and the live two-column fee-breakdown panel from the design. Submits raw inputs only to `POST /api/v1/portfolio/positions`; on success, revalidates the dashboard SWR cache and navigates to the new (or existing, for EC-001) position's detail page, passing any server-returned `warnings` through as a `?notice=` query param.
+- `app/dashboard/page.tsx` — replaced the Epic-1 stub with a real positions listing (table sourced from the new `GET /api/v1/portfolio/dashboard`), the "+ Add Position" button, and the dialog. Price/income/yield columns show "—" (see Deviation 3).
+- `app/positions/[id]/page.tsx` (new) — a position detail page: header (name/code/tag, shares, blended price, all-in cost), a dismissible notice banner reading `?notice=`, and the Lots table (shares/price/date/broker/fee breakdown) sourced from `GET /api/v1/portfolio/positions/{id}` (BE-2.3). No "Add Lot" button yet — that's FE-2.2's own scope.
+- `components/ui/dialog.tsx` (new, via `shadcn add dialog`) — this project's first modal primitive.
+- **Backend addition**: `GET /api/v1/portfolio/dashboard` (`PortfolioResponse`/`PositionSummaryResponse` schemas, `list_positions_for_portfolio` service function) — see Deviation 1 for why.
+
+**Deviations from the spec/design (deliberate adaptations, not oversights)**
+
+1. **Added a minimal slice of `GET /api/v1/portfolio/dashboard` (documented as Epic 4/BE-4.1's endpoint), pulled forward.** FE-2.1 needs *some* way to list a user's positions to host the Add Position trigger and show the result, and this is the only spec-documented endpoint for that — there is no separate "list positions" route. Dividend income and price-refresh fields are held at their documented-nullable/zero defaults, exactly like `PositionResponse` already does. This is the same "pull forward the minimal documented endpoint" pattern used for `GET /positions/{id}` in BE-2.3.
+2. **Stock code and stock name are two separate free-text fields, not the design's single autocomplete-backed "Stock code / name" field.** The design assumes a stock lookup (`GET /api/v1/stocks`) that doesn't exist yet — BE-2.1 already deferred this to Epic 9. Splitting into two explicit fields is the only way to satisfy the backend's requirement for both values without a lookup to resolve one from the other.
+3. **The positions table shows "—" for current price, income YTD, and yield** (no columns exist for these in the design's sense, since they need the price-feed and dividend epics). This mirrors the BAS's own established pattern for "no data yet" states (e.g. EC-005's null price, EC-001's "—" yield with zero dividend tranches) rather than inventing a placeholder.
+4. **Purchase date is a real editable `<input type="date">` defaulting to today**, not the design's static readonly `"2026-07-17"` prototype value.
+5. **No live browser verification was performed.** The user started installing the `claude-in-chrome` extension this session but chose to continue without it. Verification instead relied on: a clean `npm run build` (type-checked, 10/10 routes), a direct Node script confirming the ported `fee-calculator.ts` formulas produce byte-identical results to the backend for all three BAS worked examples, a live backend smoke test (register → create position → `GET /dashboard` shows it with correct aggregates), and confirming both new frontend routes (`/dashboard`, `/positions/[id]`) server-render without errors via the Next.js dev server logs. The interactive parts — the dialog opening, live preview updating as the user types, the EC-001 notice actually rendering after a duplicate-stock submission — are still the user's manual QA pass to do, same gap as every FE story since FE-1.1.
+
+**Test evidence**
+
+- `uv run pytest` (backend, for the new dashboard endpoint): 115/115 passing (111 pre-existing + 4 new: empty dashboard, aggregates across multiple positions, excludes soft-deleted positions, auth requirement).
+- `npm run build`: compiles and type-checks cleanly across all 10 routes (2 new: `/positions/[id]`, plus the rebuilt `/dashboard`).
+- Node parity check: `calculateLotFees` (client) vs `calculate_lot_fees` (server) produce identical `all_in_cost` for all three BAS US-003 examples.
+- Live smoke test: registered a user, hit `GET /api/v1/portfolio/dashboard` before and after creating a position via the real API, confirmed the position appears with correct `total_shares`/`total_all_in_cost`/`blended_purchase_price`.
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session (see Deviation 5) — the user's manual QA pass covers the dialog, live preview, and EC-001 notice.
+- `GET /api/v1/stocks` and stock-code reference validation remain deferred to Epic 9 (unchanged from BE-2.1).
 
 ---
 

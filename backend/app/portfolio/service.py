@@ -86,6 +86,19 @@ async def get_active_position_by_stock(
     return result.scalar_one_or_none()
 
 
+async def list_positions_for_portfolio(db: AsyncSession, portfolio_id: uuid.UUID) -> list[Position]:
+    """FE-2.1: backs GET /api/v1/portfolio/dashboard — the only spec-documented
+    way to list a user's positions (there is no separate list-positions
+    endpoint). Excludes soft-deleted positions.
+    """
+    result = await db.execute(
+        select(Position)
+        .where(Position.portfolio_id == portfolio_id, Position.is_deleted.is_(False))
+        .order_by(Position.created_at)
+    )
+    return list(result.scalars().all())
+
+
 async def get_position_lots(db: AsyncSession, position_id: uuid.UUID) -> list[Lot]:
     result = await db.execute(
         select(Lot)
