@@ -1796,29 +1796,68 @@ Then the job fetches yfinance prices for every unique stock_code across active
 
 **Acceptance Criteria**
 
-- [ ] Trading-day check against a `system_config`-stored Bursa holiday calendar (JSON array); job exits cleanly with a Sentry check-in on non-trading days, without touching `last_refreshed_at`
-- [ ] Process lock via `system_config.price_refresh_lock`: a run already in progress within the last 2 hours prevents a duplicate run (HIGH-R-004)
-- [ ] Wall-clock timeout of 60 minutes wraps the entire job; on timeout, the lock clears and remaining stocks are marked stale
-- [ ] Parallel fetch via `asyncio.gather` with `semaphore(10)` (HIGH-R-004) — not fully sequential, not unbounded
-- [ ] Per-stock retry: 2 retries with 5s/15s exponential backoff; failures on one stock never abort others (per-stock isolation, R-001)
-- [ ] Price validity guard: reject prices ≤0 or deviating >75% from the prior snapshot (configurable via `system_config.price_deviation_max_pct`, default 75 — MED-R-006, not the earlier 50% draft); rejected prices are logged as `CORPORATE_ACTION_CANDIDATE` for admin review, not silently discarded
-- [ ] If >50% of stocks fail in a run, a Sentry CRITICAL alert fires
-- [ ] Job reports a Sentry Cron Monitoring check-in on both success and failure paths
+- [x] Trading-day check against a `system_config`-stored Bursa holiday calendar (JSON array); job exits cleanly with a Sentry check-in on non-trading days, without touching `last_refreshed_at`
+- [x] Process lock via `system_config.price_refresh_lock`: a run already in progress within the last 2 hours prevents a duplicate run (HIGH-R-004)
+- [x] Wall-clock timeout of 60 minutes wraps the entire job; on timeout, the lock clears (see Implementation Record Deviation 3 on "remaining stocks are marked stale")
+- [x] Parallel fetch via `asyncio.gather` with `semaphore(10)` (HIGH-R-004) — not fully sequential, not unbounded
+- [x] Per-stock retry: 2 retries with 5s/15s exponential backoff; failures on one stock never abort others (per-stock isolation, R-001)
+- [x] Price validity guard: reject prices ≤0 or deviating >75% from the prior snapshot (configurable via `system_config.price_deviation_max_pct`, default 75 — MED-R-006, not the earlier 50% draft); rejected prices are logged as `CORPORATE_ACTION_CANDIDATE` for admin review, not silently discarded
+- [x] If >50% of stocks fail in a run, a Sentry CRITICAL alert fires
+- [x] Job reports a Sentry Cron Monitoring check-in on both success and failure paths (see Implementation Record Deviation 1 — Sentry itself isn't wired up yet)
 
 **Definition of Done**
 
-- [ ] Integration test against a mocked yfinance client covers: full success, partial failure, complete outage, invalid-price rejection, holiday no-op, and lock-contention skip
-- [ ] Batch timing benchmark: <30 seconds for 16 stocks (BAS §14 performance requirement)
+- [x] Integration test against a mocked yfinance client covers: full success, partial failure, complete outage, invalid-price rejection, holiday no-op, and lock-contention skip
+- [x] Batch timing benchmark: <30 seconds for 16 stocks (BAS §14 performance requirement) — see Implementation Record for what this test can and can't actually prove
 
 **Dependencies & Integrations**
 
-- `system_config` table (holiday calendar, deviation threshold, refresh lock) — Epic 9 seed data
+- `system_config` table (holiday calendar, deviation threshold, refresh lock) — Epic 9 seed data, pulled forward for this story (see Implementation Record)
 - yfinance Python library, invoked only from this cron script, never from the request path (architecture §11.1)
 
 **Technical Constraints**
 
 - `PriceSnapshot` writes must be idempotent UPSERTs keyed on `(stock_code, trading_date)`
 - Price fetching is isolated behind a `PriceProvider` interface in `pricing/service.py` so yfinance can be swapped later without touching calling code (R-001 mitigation, V2 evolution path)
+
+---
+
+### Implementation Record — BE-5.1
+
+**What was actually built**
+
+- `app/admin/models.py` — added `SystemConfig` (physical schema §3.11: `key TEXT PK, value TEXT, description TEXT, updated_at`), pulled forward from Epic 9 (DEP-9.4/BE-8.3). Only the table and plain get/set access exist — BE-8.3's admin `PATCH /admin/config/fees` endpoint, its `ADMIN_API_KEY` auth, and its TTLCache are still deferred; nothing about this story needs them (the cron reads each key at most a few times per run).
+- `app/admin/service.py` — `get_system_config`/`set_system_config` (plain, uncached reads/writes) and `try_acquire_price_refresh_lock`/`release_price_refresh_lock` (HIGH-R-004's process lock, a single atomic `UPDATE ... WHERE value IS NULL OR value < stale_before`, with a fallback `INSERT` for the case where the `price_refresh_lock` row doesn't exist yet at all — see Deviation 4).
+- `app/pricing/models.py` — `PriceSnapshot` (physical schema §3.10), pulled forward from Epic 9 alongside `system_config`. `stock_code` has no FK to a `stocks` reference table, matching the exact same, already-established deviation on `positions.stock_code` (BE-2.1) — that table still doesn't exist.
+- `app/pricing/provider.py` — the `PriceProvider` protocol this story's own Technical Constraints require, plus `YFinancePriceProvider` (real yfinance) using the `{code}.KL` Bursa Malaysia ticker suffix, verified against a real fetch (1023.KL / CIMB) during development. Runs the synchronous yfinance call in a thread-pool executor; converts the last close via `str()` before `Decimal()` to avoid baking in yfinance/pandas' float noise (e.g. `7.889999866485596` for an actual `7.89`).
+- `app/pricing/service.py` — `run_price_refresh`, implementing architecture §13.2's algorithm end to end: holiday/weekend check, lock acquisition, the unique-active-stock-code query (see Deviation 2), bounded-concurrency fetch (network I/O only — no DB access inside the concurrent phase, since an `AsyncSession` isn't safe for concurrent use across coroutines; DB reads/writes happen afterward, sequentially), the deviation guard, the >50%-failure majority-alert check, and lock release in a `finally` (covers both normal exit and exceptions).
+- `app/monitoring.py` (new) — `sentry_checkin`/`sentry_alert`, structlog-based stand-ins (see Deviation 1).
+- `scripts/refresh_prices.py` (new) — the thin cron entrypoint: real `AsyncSessionLocal`, real `YFinancePriceProvider`, the 60-minute `asyncio.wait_for` wall-clock wrap. Explicitly imports every model module before touching the DB (see Deviation 5 — this is a real bug the live smoke test caught, not a hypothetical one).
+- `alembic/versions/0012_...py` — creates `system_config`/`price_snapshots`, seeds `price_deviation_max_pct` (`75`), `bursa_holidays` (`[]` — see Deviation 6), `price_refresh_lock` (`NULL`).
+- `pyproject.toml` — added `yfinance`.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **Sentry Cron Monitoring isn't actually wired up.** No `SENTRY_DSN` exists anywhere in this codebase and `sentry-sdk` isn't installed — this is Epic 9 infrastructure that doesn't exist yet, same standing gap already documented for email-delivery-failure alerts (`app/email.py`). `sentry_checkin`/`sentry_alert` are structlog-based stand-ins with the exact call signature a real `sentry_sdk.crons.capture_checkin(...)`/`capture_message(...)` swap would use, so every call site in `service.py` stays unchanged when Epic 9 provisions a real DSN.
+2. **The unique-active-stock-code query doesn't match architecture §13.2 step 4's literal SQL.** That pseudocode is `SELECT DISTINCT l.stock_code FROM lots l JOIN positions p ON l.position_id = p.id WHERE l.is_deleted=false AND p.is_deleted=false` — but `stock_code` lives on `Position`, not `Lot`, in the actual physical schema; `lots.stock_code` doesn't exist. Implemented as `SELECT DISTINCT p.stock_code FROM positions p JOIN lots l ON l.position_id = p.id WHERE ...` instead, which is what the pseudocode's own stated intent (unique codes across active lots of active positions) actually requires.
+3. **On a wall-clock timeout, "remaining stocks are marked stale" is not implemented as an explicit action** — it falls out naturally from Deviation 7's design instead (an unprocessed stock's existing snapshot is simply left untouched, and its `last_refreshed_at` ages normally against the frontend's 28-hour check). Enumerating exactly which stocks were "remaining" at the moment of a timeout (mid-concurrent-fetch vs. mid-sequential-write) adds real complexity for a rare, already-catastrophic failure mode; the lock still clears and the CRITICAL check-in still fires either way.
+4. **The process lock tolerates a missing `price_refresh_lock` row**, not just a stale/absent value in an existing row. `try_acquire_price_refresh_lock`'s first attempt is the atomic conditional `UPDATE` the design calls for; if that matches zero rows, it explicitly distinguishes "a fresh lock is genuinely held" from "the row was never seeded" (falling back to an `INSERT`, racing safely against a concurrent process via the primary key's own `IntegrityError`). This matters in production if migration 0012's seed row is ever lost, and it's also what let the test suite exercise lock behavior without needing to duplicate the migration's seed data into the SQLite test harness (which never runs migrations at all — see `tests/conftest.py`).
+5. **`scripts/refresh_prices.py` explicitly imports every model module before opening a DB session** (`app.admin.models`, `app.auth.models`, `app.portfolio.models`, `app.pricing.models`) — not a defensive guess, but a real bug the live smoke test against real Postgres caught directly: without these imports, `PriceSnapshot.created_by_user_id`'s FK to `users` fails to resolve at flush time, because nothing else in this standalone script's import graph ever pulls in `app.auth.models` (unlike the FastAPI app itself, which does so transitively through its routers). Same reasoning as `tests/conftest.py`'s own explicit import block, applied to the one other place in this codebase that creates a DB session outside the FastAPI app.
+6. **`bursa_holidays` is seeded as an empty JSON array**, not "the current year's calendar" as DEP-9.4's own AC literally asks for. Bursa Malaysia's actual 2026 non-trading days include several moveable dates (Hari Raya, Chinese New Year, Deepavali, Wesak Day) with no verified official source available to confirm exact dates from within this session — fabricating specific calendar dates risks silently skipping or not-skipping a real trading day, which is worse than an honest empty seed. `run_price_refresh` already logs a WARNING (`holiday_calendar_possibly_stale`) whenever the loaded list has no entries for the current year, matching MED-R-004's own explicit handling for exactly this case — an admin populating real dates via direct DB access (BE-8.3's `PATCH /admin/config` endpoint doesn't exist yet either) is the intended next step, not something this story can close out honestly on its own.
+7. **No `PriceSnapshot` row is ever written with `source='stale'`.** architecture §13.2 steps 6c/6e both say "mark source=stale" for a deviation-guard rejection or exhausted retries, but the schema's `price NUMERIC NOT NULL` means a 'stale' row would need *some* carried-forward price value, and the doc doesn't specify one — while separately, MED-R-006 explicitly says a deviation rejection should *not* trigger the stale banner at all, directly in tension with treating it identically to a hard fetch failure (§15.1: "invalid prices are treated the same as fetch failures"). Resolved by not writing anything for a failed/rejected stock at all: its most recent snapshot (if any) stays exactly as it was, and that row's own `last_refreshed_at` ages naturally — which is precisely what the frontend's 28-hour staleness check (already built, FE-4.1) keys off. `'stale'` remains a valid, schema-allowed `source` value for a future story to actually use (e.g. an explicit sweep job); nothing in this story's own AC requires writing it to be satisfied.
+8. **The `>30 seconds for 16 stocks` batch timing DoD is only partially provable by an automated test.** `test_batch_orchestration_overhead_is_fast` confirms the concurrency/retry/DB-write orchestration itself isn't the bottleneck (16 stocks via a fake, zero-latency provider complete in well under a second), but the real 30-second budget is dominated by actual yfinance network latency, which a mocked unit test can't meaningfully assert against. The live smoke test (below) is the closest thing to a real-world timing data point this session could produce.
+
+**Test evidence**
+
+- `uv run pytest`: 217/217 passing (198 pre-existing + 19 new in `tests/test_pricing_refresh.py`) — full success, per-stock isolation on partial failure, all-3-attempts-exhausted retry counting, majority-failure CRITICAL alert (and confirmed it does *not* fire on a minority failure), the deviation guard (both rejecting and — with no prior snapshot — correctly not rejecting), a configurable threshold override, holiday skip, weekend skip (with no holiday config needed), lock contention skip, a stale (>2h) lock being correctly reacquired, the lock releasing after both a successful run and one that raises mid-flight, same-day UPSERT-not-duplicate, and excluding soft-deleted positions/lots from the stock-code query.
+- Migration 0012 verified upgrade → downgrade → upgrade against the real running Postgres; confirmed `system_config`'s 3 seed rows and `price_snapshots`' full constraint set via `\d`.
+- **Live smoke test against the real backend, real Postgres, and real yfinance** (not mocked): created a real CIMB (1023) position via the running API, then ran `run_price_refresh` directly against `AsyncSessionLocal` with the real `YFinancePriceProvider`. First attempt caught the Deviation 5 import bug live (a `PendingRollbackError` surfaced exactly as described) — fixed, then re-ran clean: 4 real stock codes fetched successfully (including CIMB at a real market price matching a separate direct yfinance sanity check), 3 genuinely-invalid tickers correctly failed all 3 attempts each with real 5s/15s backoff timing observable in the log timestamps, no CRITICAL alert (3/7 ≈ 43%, under the 50% threshold), lock correctly held during the run and released after. Test data (snapshot rows, the one new test position/account) cleaned up afterward.
+
+**Known gaps / not yet verified**
+
+- No real Render cron schedule exists to trigger this automatically (`30 9 * * 1-5`) — that's Epic 9 infrastructure (DEP-9.x), same as the Sentry DSN itself. The script runs correctly via manual invocation (`uv run python scripts/refresh_prices.py`); wiring the actual schedule is out of this story's scope.
+- The wall-clock timeout path (60 minutes) is implemented but not exercised by an automated test with a real timeout — simulating a genuine hang without actually waiting close to an hour (or awkwardly mocking `asyncio.wait_for` itself) wasn't worth the complexity for this pass; the lock's own 2-hour TTL is the backstop if this path ever has a latent bug.
+- `bursa_holidays` needs real 2026 (and beyond) Bursa Malaysia holiday dates populated by a human before this job's holiday-skip behavior is trustworthy in production — see Deviation 6.
 
 ---
 

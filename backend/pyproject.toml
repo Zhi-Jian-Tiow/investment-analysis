@@ -18,6 +18,7 @@ dependencies = [
     "slowapi>=0.1.9",
     "structlog>=24.1",
     "resend>=2.0",
+    "yfinance>=1.5.2",
 ]
 
 [dependency-groups]

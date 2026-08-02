@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 import app.admin.models  # noqa: F401
 import app.auth.models  # noqa: F401
 import app.portfolio.models  # noqa: F401
+import app.pricing.models  # noqa: F401
 from app.auth.lockout import tracker as login_lockout_tracker
 from app.config import Settings, get_settings
 from app.database import Base, get_db

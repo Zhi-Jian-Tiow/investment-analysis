@@ -1,8 +1,13 @@
-"""audit_log (BursaTrack-DB-Stage3-Physical-Schema.md §3.12).
+"""audit_log, system_config (BursaTrack-DB-Stage3-Physical-Schema.md §3.11-3.12).
 
-system_config and system_deletion_log (§3.11, §3.13) belong to later epics
-(fee config administration, PDPA hard-delete) and are added when those stories
-are implemented.
+system_config is pulled forward from Epic 9 (DEP-9.4/BE-8.3) for BE-5.1 — the
+price refresh cron needs somewhere to store the Bursa holiday calendar, the
+price deviation threshold, and its process lock. Only the table itself and
+plain get/set access are built here; BE-8.3's admin PATCH endpoint (with its
+own TTLCache and ADMIN_API_KEY auth) is still deferred.
+
+system_deletion_log (§3.13) belongs to Epic 8 (PDPA hard-delete) and is added
+when that story is implemented.
 """
 
 import uuid
@@ -63,3 +68,20 @@ class AuditLog(Base):
     # (Base.metadata is the schema MetaData object).
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SystemConfig(Base):
+    """Key-value store for operational parameters (physical schema §3.11).
+    `value` is always TEXT — callers parse to whatever type they need
+    (Decimal, JSON, an ISO timestamp). `value IS NULL` is a valid state (e.g.
+    `price_refresh_lock` when no lock is currently held).
+    """
+
+    __tablename__ = "system_config"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str | None] = mapped_column(String, nullable=True)
+    description: Mapped[str | None] = mapped_column(String, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
