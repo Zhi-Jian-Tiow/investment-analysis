@@ -10,13 +10,13 @@ import { AddPositionDialog } from "@/components/portfolio/AddPositionDialog";
 import { Button } from "@/components/ui/button";
 import { useDashboard } from "@/hooks/useDashboard";
 import { useDividendCalendar } from "@/hooks/useDividendCalendar";
+import { ApiError, apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { CATEGORY_TAG_STYLES } from "@/lib/category-tags";
+import { STALE_THRESHOLD_MS } from "@/lib/constants";
 import { computeYieldPercent, formatPercent } from "@/lib/dividend-calculator";
 import type { PositionSummaryResponse } from "@/lib/types";
 
-// architecture §15.1
-const STALE_THRESHOLD_MS = 28 * 60 * 60 * 1000;
 const SORT_STORAGE_KEY = "bursatrack:dashboard:sort";
 
 type SortKey = "name" | "shares" | "avg" | "cost" | "price" | "value" | "pl" | "income" | "yield";
@@ -57,6 +57,26 @@ function formatDate(value: string): string {
   const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const [y, m, d] = value.split("-").map((part) => parseInt(part, 10));
   return `${d} ${months[m - 1]} ${y}`;
+}
+
+// EX-001's "[last successful refresh timestamp]" — date + time, in the
+// viewer's local timezone (unlike formatDate, which works off a plain
+// YYYY-MM-DD calendar date with no timezone to resolve).
+function formatDateTime(value: string): string {
+  const d = new Date(value);
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const datePart = `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+  const timePart = d.toLocaleTimeString("en-MY", { hour: "numeric", minute: "2-digit" });
+  return `${datePart}, ${timePart}`;
+}
+
+function todayIso(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function formatManualBadgeTime(value: string): string {
+  return new Date(value).toLocaleTimeString("en-MY", { hour: "numeric", minute: "2-digit" });
 }
 
 function positionYieldPercent(position: PositionSummaryResponse) {
@@ -110,9 +130,13 @@ function compareRows(a: PositionSummaryResponse, b: PositionSummaryResponse, sor
 
 function DashboardContent() {
   const { user } = useAuth();
-  const { portfolio, positions, isLoading } = useDashboard();
+  const { portfolio, positions, isLoading, mutate } = useDashboard();
   const [addPositionOpen, setAddPositionOpen] = useState(false);
   const [sort, setSort] = useState<SortState>(DEFAULT_SORT);
+  const [overrideCode, setOverrideCode] = useState<string | null>(null);
+  const [overrideValue, setOverrideValue] = useState("");
+  const [overrideError, setOverrideError] = useState<string | null>(null);
+  const [overrideSaving, setOverrideSaving] = useState(false);
 
   const currentYear = new Date().getFullYear();
   const { tranches } = useDividendCalendar(currentYear);
@@ -140,10 +164,50 @@ function DashboardContent() {
     });
   }
 
+  function openOverride(position: PositionSummaryResponse) {
+    setOverrideCode(position.stock_code);
+    setOverrideValue("");
+    setOverrideError(null);
+  }
+
+  function closeOverride() {
+    setOverrideCode(null);
+    setOverrideValue("");
+    setOverrideError(null);
+  }
+
+  async function saveOverride(position: PositionSummaryResponse) {
+    const trimmed = overrideValue.trim();
+    const parsed = parseFloat(trimmed);
+    if (!trimmed || !(parsed > 0)) {
+      setOverrideError("Price must be greater than zero");
+      return;
+    }
+    setOverrideSaving(true);
+    setOverrideError(null);
+    try {
+      await apiFetch("/api/v1/pricing/manual-override", {
+        method: "POST",
+        body: JSON.stringify({
+          stock_code: position.stock_code,
+          price: trimmed,
+          trading_date: todayIso(),
+        }),
+      });
+      closeOverride();
+      await mutate();
+    } catch (err) {
+      setOverrideError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
+    } finally {
+      setOverrideSaving(false);
+    }
+  }
+
   if (!user) return null; // AuthGate guarantees this, but keeps TS happy
 
   const isReadOnly = user.account_status === "trial_expired";
   const staleList = positions.filter(isStale);
+  const isCompleteOutage = positions.length > 0 && staleList.length === positions.length;
   const sortedPositions = positions.slice().sort((a, b) => compareRows(a, b, sort));
   const blendedYield = portfolio ? computeYieldPercent(portfolio.total_dividend_income_ytd, portfolio.total_all_in_cost) : null;
   const trancheCount = tranches.length;
@@ -168,9 +232,20 @@ function DashboardContent() {
         {staleList.length > 0 && (
           <div className="mb-4.5 flex items-center gap-2.5 rounded-lg border border-[#F0D9A6] bg-[#FFF6E3] px-4 py-3 text-[13.5px] text-[#8A5A00]">
             <span>⚠</span>
-            <span>
-              Price data unavailable for <strong>{staleList.length} stock{staleList.length === 1 ? "" : "s"}</strong> — showing prices as of their last refresh. Update prices manually below.
-            </span>
+            {isCompleteOutage ? (
+              // EX-001: complete outage — no stocks priced at all.
+              <span>
+                Price data unavailable — showing prices as of{" "}
+                {portfolio?.last_price_refresh_at ? formatDateTime(portfolio.last_price_refresh_at) : "the last refresh"}.
+                Update prices manually below.
+              </span>
+            ) : (
+              // EX-002: partial failure — some but not all stocks affected.
+              <span>
+                Price data unavailable for {staleList.length} stock{staleList.length === 1 ? "" : "s"} —{" "}
+                {staleList.map((p) => p.stock_name).join(", ")}. Showing last known prices.
+              </span>
+            )}
           </div>
         )}
 
@@ -181,7 +256,7 @@ function DashboardContent() {
               {portfolio?.last_price_refresh_at ? (
                 <>
                   <span className={`inline-block h-2 w-2 rounded-full ${staleList.length > 0 ? "bg-[#E0A526]" : "bg-[#17A05E]"}`} />
-                  <span>Last refreshed: {formatDate(portfolio.last_price_refresh_at.slice(0, 10))}</span>
+                  <span>Last refreshed: {formatDateTime(portfolio.last_price_refresh_at)}</span>
                 </>
               ) : (
                 <span>{portfolio ? `${positions.length} position${positions.length === 1 ? "" : "s"} · prices not yet refreshed` : "Loading…"}</span>
@@ -308,16 +383,66 @@ function DashboardContent() {
                         <td className="px-3.5 py-3 text-right">{formatMoney(position.blended_purchase_price)}</td>
                         <td className="px-3.5 py-3 text-right">{formatMoney(position.total_all_in_cost)}</td>
                         <td className="px-3.5 py-3 text-right whitespace-nowrap">
-                          <span className={position.current_price === null ? "text-muted-foreground" : ""}>
-                            {formatMoneyOrDash(position.current_price)}
-                          </span>
-                          {stale && (
-                            <span
-                              aria-label="Stale price"
-                              className="ml-1.5 rounded-full border border-[#F0D9A6] bg-[#FFF6E3] px-2 py-0.5 text-[11px] font-semibold text-[#8A5A00]"
-                            >
-                              ⚠ Stale
-                            </span>
+                          {overrideCode === position.stock_code ? (
+                            isReadOnly ? (
+                              // EC-020: trial-expired accounts get a paywall
+                              // prompt in place of the override input.
+                              <span className="inline-flex items-center gap-2 text-[12px] text-[#8A5A00]">
+                                Subscribe to override prices manually.
+                                <button
+                                  onClick={closeOverride}
+                                  className="text-tertiary underline hover:text-foreground"
+                                >
+                                  Dismiss
+                                </button>
+                              </span>
+                            ) : (
+                              <span className="inline-flex flex-col items-end gap-1">
+                                <span className="inline-flex items-center gap-1.5">
+                                  <input
+                                    autoFocus
+                                    value={overrideValue}
+                                    onChange={(e) => setOverrideValue(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") saveOverride(position);
+                                      if (e.key === "Escape") closeOverride();
+                                    }}
+                                    inputMode="decimal"
+                                    placeholder={position.current_price ?? "0.00"}
+                                    disabled={overrideSaving}
+                                    className="w-[74px] rounded-md border border-primary px-2 py-1 text-[13px] focus:ring-3 focus:ring-primary/15 focus:outline-none"
+                                  />
+                                  <button
+                                    onClick={() => saveOverride(position)}
+                                    disabled={overrideSaving}
+                                    className="rounded-md bg-primary px-2.5 py-1 text-[12px] font-semibold text-primary-foreground hover:bg-[#2F41C4] disabled:opacity-60"
+                                  >
+                                    Save
+                                  </button>
+                                </span>
+                                {overrideError && <span className="text-[11px] text-destructive">{overrideError}</span>}
+                              </span>
+                            )
+                          ) : (
+                            <>
+                              <span className={position.current_price === null ? "text-muted-foreground" : ""}>
+                                {formatMoneyOrDash(position.current_price)}
+                              </span>
+                              {stale && (
+                                <button
+                                  onClick={() => openOverride(position)}
+                                  aria-label="Stale price. Click to enter price manually."
+                                  className="ml-1.5 rounded-full border border-[#F0D9A6] bg-[#FFF6E3] px-2 py-0.5 text-[11px] font-semibold text-[#8A5A00] hover:bg-[#FBEBC7]"
+                                >
+                                  ⚠ Stale
+                                </button>
+                              )}
+                              {!stale && position.price_source === "manual" && position.price_last_refreshed_at && (
+                                <span className="ml-1.5 rounded-full border border-[#C9D4FA] bg-[#EBF0FF] px-2 py-0.5 text-[11px] font-semibold text-[#2B3EB8]">
+                                  Manual · {formatManualBadgeTime(position.price_last_refreshed_at)}
+                                </span>
+                              )}
+                            </>
                           )}
                         </td>
                         <td className="px-3.5 py-3 text-right">
@@ -339,9 +464,6 @@ function DashboardContent() {
                   })}
                 </tbody>
               </table>
-            </div>
-            <div className="border-t border-[#F0F0ED] bg-[#FAFAF8] px-3.5 py-2.5 font-mono text-xs text-tertiary">
-              Price, market value, and P/L show — until prices are refreshed (arrives in a later epic).
             </div>
           </div>
         )}

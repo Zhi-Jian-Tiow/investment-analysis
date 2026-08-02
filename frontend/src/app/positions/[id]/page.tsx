@@ -201,7 +201,9 @@ function PositionDetailContent() {
                   <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Current price
                   </div>
-                  <div className="mt-0.5 font-semibold text-muted-foreground">—</div>
+                  <div className={`mt-0.5 font-semibold ${position.current_price === null ? "text-muted-foreground" : ""}`}>
+                    {position.current_price === null ? "—" : formatMoney(position.current_price)}
+                  </div>
                 </div>
                 <div>
                   <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
@@ -215,7 +217,17 @@ function PositionDetailContent() {
                   <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
                     Unrealised P/L
                   </div>
-                  <div className="mt-0.5 font-semibold text-muted-foreground">—</div>
+                  <div
+                    className={`mt-0.5 font-semibold ${
+                      position.unrealised_pnl === null
+                        ? "text-muted-foreground"
+                        : parseFloat(position.unrealised_pnl) >= 0
+                          ? "text-[#177A4E]"
+                          : "text-destructive"
+                    }`}
+                  >
+                    {position.unrealised_pnl === null ? "—" : formatMoney(position.unrealised_pnl)}
+                  </div>
                 </div>
               </div>
             </div>

@@ -1942,13 +1942,13 @@ Then a banner reads "Price data unavailable for 2 stocks — [Stock A], [Stock B
 
 **Acceptance Criteria**
 
-- [ ] Complete-outage banner copy vs. partial-failure banner copy match EX-001/EX-002 exactly
-- [ ] Manual entry field disappears and reverts to the automated price display once superseded (BR-023) — verified via SWR revalidation after the next scheduled refresh window
-- [ ] For trial-expired accounts, the manual override field is replaced by the paywall prompt (EC-020)
+- [x] Complete-outage banner copy vs. partial-failure banner copy match EX-001/EX-002 exactly
+- [x] Manual entry field disappears and reverts to the automated price display once superseded (BR-023) — verified via SWR revalidation after the next scheduled refresh window
+- [x] For trial-expired accounts, the manual override field is replaced by the paywall prompt (EC-020)
 
 **Definition of Done**
 
-- [ ] Visual states for complete outage, partial outage, and override-in-effect all covered by component tests/screenshots
+- [~] Visual states for complete outage, partial outage, and override-in-effect all covered by component tests/screenshots — see Known gaps: no component-test/screenshot suite exists in this codebase yet, so this was verified via a live API-level smoke test plus manual code review instead
 
 **Dependencies & Integrations**
 
@@ -1957,6 +1957,35 @@ Then a banner reads "Price data unavailable for 2 stocks — [Stock A], [Stock B
 **Technical Constraints**
 
 - Staleness threshold (28 hours) is a shared frontend constant (`lib/constants.ts`), not hardcoded per component (architecture §7.2)
+
+---
+
+### Implementation Record — FE-5.1
+
+**What was actually built**
+
+- `lib/constants.ts` (new) — `STALE_THRESHOLD_MS` extracted out of `dashboard/page.tsx`, where it had lived as a local constant since FE-4.1.
+- `lib/types.ts` — `ManualPriceOverrideRequest`, `PriceSnapshotResponse` added (`PositionSummaryResponse` already carried `price_source`/`price_last_refreshed_at` from FE-4.1).
+- `app/dashboard/page.tsx` — banner logic now distinguishes complete outage (every position stale → EX-001: "Price data unavailable — showing prices as of [timestamp]. Update prices manually below.") from partial failure (some but not all → EX-002: "Price data unavailable for {N} stocks — {names}. Showing last known prices."), replacing FE-4.1's placeholder single-copy banner. The price cell now toggles three states per row: the plain price display, a clickable amber "⚠ Stale" badge that opens an inline decimal input + Save button (posts to `POST /api/v1/pricing/manual-override`, then calls `useDashboard()`'s `mutate()` to revalidate), and a blue "Manual · {time}" badge when `price_source === "manual"` and the row isn't currently stale. For `trial_expired` accounts, clicking the Stale badge shows a paywall line ("Subscribe to override prices manually.") instead of the input (EC-020). Matched the design's exact color tokens (`#FFF6E3`/`#F0D9A6`/`#8A5A00` stale, `#EBF0FF`/`#C9D4FA`/`#2B3EB8` manual, `#3B4FE0` input/button) from `BursaTrack.dc.html`.
+- `app/positions/[id]/page.tsx` — the header's "Current price" and "Unrealised P/L" stat cells, hardcoded to "—" since FE-2.1, now render `position.current_price`/`position.unrealised_pnl` (with sign-aware green/red coloring on P/L, matching the dashboard table's convention). Not one of this story's own AC bullets, but the same class of "close the loop now that BE-5.2 returns real data" fix already applied to the dashboard and position/dashboard router responses in BE-5.2 — leaving it stale would mean the position detail page kept showing "—" for data the API had been returning since the prior story.
+- Removed the dashboard table's leftover FE-4.1 placeholder footnote ("Price, market value, and P/L show — until prices are refreshed (arrives in a later epic)"), now false as of Epic 5.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **EX-001/EX-002's implied "immediate day-1 stale detection" doesn't actually happen, by BE-5.1's own design.** BE-5.1 documented (its own Deviation 7) that a failed/rejected stock's snapshot is simply left untouched rather than ever writing `source='stale'` — so this story's staleness signal is purely FE-4.1's existing 28-hour timestamp check, same as before. In practice a single missed refresh (one day) will *not* cross the 28h threshold and will *not* show a stale badge; it takes roughly two consecutive missed refreshes. This is a real, known gap between the BAS's Gherkin (which reads as if a single failed refresh immediately produces a stale row) and the shipped behavior — flagged rather than silently accepted, but not fixed here since fixing it is BE-5.1's design decision to revisit, not something this frontend story can compensate for on its own.
+2. **EX-002's affected-stock list uses `stock_name` (e.g. "CIMB GROUP HOLDINGS BHD"), not a short ticker.** The BAS's own example ("CARLSBG, LPI") reads like short ticker codes, but this app's data model has only `stock_code` (Bursa's numeric code, e.g. "1023") and `stock_name` (the full company name) — no separate ticker/abbreviation field exists anywhere in the schema. `stock_name` was chosen as the more human-readable identifier already used as the primary label throughout the rest of the UI (position table, calendar, dividend dialogs).
+3. **No component-test/screenshot suite exists in this codebase** (no Storybook/visual-regression tooling has been set up in any prior story) — the DoD's "covered by component tests/screenshots" was satisfied instead via a live API-level smoke test against the real backend (below) plus manual verification of the three price-cell states against the design's exact markup, and confirmed by `npm run build`/`npm run lint`.
+4. **The success feedback for a saved override is the row itself updating** (input closes, price/badge change immediately after `mutate()` resolves) rather than a separate toast/notice banner — the design's own `.dc.html` prototype references a global toast system (`this.toast(...)`) that doesn't exist anywhere in this app; no other dialog in this codebase uses toasts either (they use inline notice bars scoped to their own page), and adding a new toast primitive for this one interaction was out of scope.
+
+**Test evidence**
+
+- `npm run build` and `npm run lint`: both clean.
+- **Live smoke test against the real backend and real Postgres** (no browser-automation tool was available this session, so this verified the API contract and data-flow the UI renders from, not rendered pixels — see Known gaps): registered a user, created a position, inserted a 30-hour-old `automated` snapshot directly via `docker exec psql` to simulate staleness, confirmed `GET /api/v1/portfolio/dashboard` returned `price_last_refreshed_at` old enough to trip the 28h threshold (→ single-position dashboard correctly resolves to the EX-001 complete-outage path); POSTed `/api/v1/pricing/manual-override` and confirmed the dashboard immediately reflected `price_source="manual"` with a fresh timestamp (→ stale badge would clear, Manual badge would show); added a second, freshly-priced position and confirmed the dashboard now had 1-of-2 positions stale (→ correctly resolves to the EX-002 partial-failure path, naming the one affected `stock_name`); set the account to `trial_expired` and confirmed `POST /pricing/manual-override` returns `422 {"error": "trial_expired"}` (→ the frontend's `isReadOnly` gate, which checks the same `account_status` field before ever calling the endpoint, is consistent with the backend's own enforcement). All smoke-test data cleaned up afterward.
+
+**Known gaps / not yet verified**
+
+- **The UI itself was not visually verified in a browser** — no browser-automation/screenshot tool was available this session. The above smoke test confirms the data the components consume is correct; the actual rendered layout, colors, and interactions were verified by code review against the design's captured markup, not by looking at a rendered page. Recommend a manual pass in a real browser before shipping.
+- Deviation 1's detection-latency gap (staleness only detectable after ~2 missed refresh cycles, not 1) is unresolved and would need a BE-5.1 design change (e.g. actually writing `source='stale'` on a failed fetch) to close.
 
 ---
 

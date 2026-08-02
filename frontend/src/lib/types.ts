@@ -168,3 +168,17 @@ export interface SellScenarioResponse {
   disclaimer_required: boolean;
   scenarios: SellScenarioRow[];
 }
+
+export interface ManualPriceOverrideRequest {
+  stock_code: string;
+  price: string;
+  trading_date: string;
+}
+
+export interface PriceSnapshotResponse {
+  stock_code: string;
+  price: string;
+  source: "automated" | "manual" | "stale";
+  trading_date: string;
+  refreshed_at: string;
+}
