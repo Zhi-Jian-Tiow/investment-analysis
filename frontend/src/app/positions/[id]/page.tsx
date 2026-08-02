@@ -3,7 +3,7 @@
 import Decimal from "decimal.js";
 import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppHeader } from "@/components/layout/AppHeader";
@@ -13,14 +13,24 @@ import { EditDividendDialog } from "@/components/portfolio/EditDividendDialog";
 import { EditLotDialog } from "@/components/portfolio/EditLotDialog";
 import { ConfirmDialog } from "@/components/shared/ConfirmDialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useBrokers } from "@/hooks/useBrokers";
 import { useDashboard } from "@/hooks/useDashboard";
 import { usePosition } from "@/hooks/usePosition";
-import { apiFetch } from "@/lib/api";
+import { useSellScenario } from "@/hooks/useSellScenario";
+import { ApiError, apiFetch } from "@/lib/api";
 import { CATEGORY_TAG_STYLES } from "@/lib/category-tags";
 import { computeYieldPercent, formatPercent } from "@/lib/dividend-calculator";
 import { brokerNote } from "@/lib/fee-calculator";
 import type { BrokerConfigResponse, PositionResponse } from "@/lib/types";
+
+// BR-020's exact mandated copy — non-dismissable, per this story's own AC.
+const SELL_DISCLOSURE_TEXT =
+  "Calculations are informational only. BursaTrack is not a financial advisor. Settlement on Bursa Malaysia is T+2 — cash from a sale is available two trading days after the trade date.";
+// BR-021's exact mandated copy — required on every page displaying P/L.
+const GENERAL_DISCLAIMER_TEXT =
+  "BursaTrack is a portfolio tracking tool and does not provide financial advice. All calculations are informational only.";
 
 function formatMoney(value: string): string {
   return "RM " + parseFloat(value).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -43,7 +53,7 @@ function PositionDetailContent() {
   const { position, isLoading, error, mutate: revalidatePosition } = usePosition(params.id);
   const { brokers } = useBrokers();
   const { mutate: revalidateDashboard } = useDashboard();
-  const [tab, setTab] = useState<"lots" | "dividends">("lots");
+  const [tab, setTab] = useState<"lots" | "dividends" | "sell">("lots");
   const [addLotOpen, setAddLotOpen] = useState(false);
   const [editingLotId, setEditingLotId] = useState<string | null>(null);
   const [deletingLotId, setDeletingLotId] = useState<string | null>(null);
@@ -229,6 +239,15 @@ function PositionDetailContent() {
               >
                 Dividends ({position.dividend_tranches.length})
               </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={tab === "sell"}
+                onClick={() => setTab("sell")}
+                className={`-mb-px border-b-2 px-4 py-2.5 text-sm font-semibold ${tab === "sell" ? "border-primary text-primary" : "border-transparent text-muted-foreground hover:text-foreground"}`}
+              >
+                Sell Calculator
+              </button>
             </div>
 
             {tab === "lots" && (
@@ -347,6 +366,8 @@ function PositionDetailContent() {
                 onDeleteDividend={(id) => setDeletingTrancheId(id)}
               />
             )}
+
+            {tab === "sell" && <SellCalculatorTab position={position} brokers={brokers} />}
           </>
         )}
       </main>
@@ -558,6 +579,198 @@ function DividendsTab({
           </div>
         </div>
       )}
+    </>
+  );
+}
+
+function formatSignedMoney(value: string): string {
+  const n = parseFloat(value);
+  const abs = Math.abs(n).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (n >= 0 ? "+RM " : "-RM ") + abs;
+}
+
+function SellCalculatorTab({ position, brokers }: { position: PositionResponse; brokers: BrokerConfigResponse[] }) {
+  const [sharesInput, setSharesInput] = useState(String(position.total_shares));
+  const [customPriceInput, setCustomPriceInput] = useState("");
+  const [brokerId, setBrokerId] = useState("");
+
+  const [debouncedShares, setDebouncedShares] = useState(position.total_shares);
+  const [debouncedCustomPrice, setDebouncedCustomPrice] = useState("");
+
+  // "Live" per this story's AC, but debounced (400ms) rather than
+  // per-keystroke — this endpoint is rate-limited (60/min) and a live
+  // per-character refetch while typing a share count would burn through
+  // that budget in a few seconds.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const n = parseInt(sharesInput, 10);
+      setDebouncedShares(Number.isFinite(n) && n > 0 ? Math.min(n, position.total_shares) : position.total_shares);
+    }, 400);
+    return () => clearTimeout(t);
+  }, [sharesInput, position.total_shares]);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const trimmed = customPriceInput.trim();
+      const n = parseFloat(trimmed);
+      setDebouncedCustomPrice(trimmed && n > 0 ? n.toFixed(4) : "");
+    }, 400);
+    return () => clearTimeout(t);
+  }, [customPriceInput]);
+
+  const { scenario, isLoading, error } = useSellScenario(position.id, {
+    shares: debouncedShares,
+    customPrice: debouncedCustomPrice || undefined,
+    brokerId: brokerId || undefined,
+  });
+
+  const breakEvenRow = scenario?.scenarios.find((r) => r.break_even);
+
+  return (
+    <>
+      {/* BR-020: non-dismissable — no close/hide control anywhere on this. */}
+      <div className="mb-4 rounded-lg border border-[#F0D9A6] bg-[#FFF6E3] px-4 py-3 text-[13px] text-[#8A5A00]">
+        {SELL_DISCLOSURE_TEXT}
+      </div>
+
+      <div className="mb-4 flex flex-wrap items-end gap-5.5 rounded-xl border border-border bg-card px-5 py-4.5">
+        <div>
+          <Label htmlFor="sc-shares" className="mb-1.5 text-[12.5px] font-semibold">
+            Shares to sell
+          </Label>
+          <Input
+            id="sc-shares"
+            inputMode="numeric"
+            value={sharesInput}
+            onChange={(e) => setSharesInput(e.target.value)}
+            className="w-[120px]"
+          />
+          <p className="mt-1 max-w-[220px] text-[11.5px] text-tertiary">
+            Cost basis is proportional (weighted average) — BR-024, not FIFO.
+          </p>
+        </div>
+        <div>
+          <Label htmlFor="sc-broker" className="mb-1.5 text-[12.5px] font-semibold">
+            Sell broker
+          </Label>
+          <select
+            id="sc-broker"
+            value={brokerId}
+            onChange={(e) => setBrokerId(e.target.value)}
+            className="h-9 rounded-lg border border-input bg-card px-2.5 text-sm"
+          >
+            <option value="">Default (most recently added lot&apos;s broker)</option>
+            {brokers.map((b) => (
+              <option key={b.id} value={b.id}>
+                {b.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <Label htmlFor="sc-custom-price" className="mb-1.5 text-[12.5px] font-semibold">
+            Custom sell price (RM)
+          </Label>
+          <Input
+            id="sc-custom-price"
+            inputMode="decimal"
+            placeholder="e.g. 8.60"
+            value={customPriceInput}
+            onChange={(e) => setCustomPriceInput(e.target.value)}
+            className="w-[120px]"
+          />
+        </div>
+        <div className="ml-auto text-right">
+          <div className="text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+            Cost basis ({formatShares(scenario?.shares_to_sell ?? debouncedShares)} shares)
+          </div>
+          <div className="mt-0.5 text-[17px] font-bold">{scenario ? formatMoney(scenario.buy_cost_basis) : "—"}</div>
+          <div className="text-[11.5px] text-tertiary">
+            Break-even{" "}
+            {breakEvenRow ? (
+              <>
+                ≈ <strong className="text-foreground">{formatMoney(breakEvenRow.price)}</strong>
+              </>
+            ) : (
+              "not reached in this range"
+            )}
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div className="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-[13px] text-destructive">
+          {error instanceof ApiError ? error.message : "Couldn't load the sell scenario. Please try again."}
+        </div>
+      )}
+
+      <div className="rounded-xl border border-border bg-card">
+        <div className="max-h-[520px] overflow-auto">
+          <table className="w-full min-w-[860px] border-collapse text-[13px]">
+            <thead>
+              <tr className="sticky top-0 z-[1] border-b border-border bg-card">
+                <th className="sticky left-0 z-[1] bg-card px-3.5 py-2.5 text-left text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                  Sell Price
+                </th>
+                <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                  Gross Proceeds
+                </th>
+                <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                  Brokerage
+                </th>
+                <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                  Clearing
+                </th>
+                <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                  Stamp Duty
+                </th>
+                <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                  Net Proceeds
+                </th>
+                <th className="px-3.5 py-2.5 text-right text-[11.5px] font-semibold tracking-wide text-tertiary uppercase">
+                  P / L
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {isLoading && !scenario && (
+                <tr>
+                  <td colSpan={7} className="px-3.5 py-8 text-center text-sm text-muted-foreground">
+                    Loading scenarios…
+                  </td>
+                </tr>
+              )}
+              {scenario?.scenarios.map((row) => {
+                const isCustomRow = Boolean(debouncedCustomPrice) && parseFloat(row.price).toFixed(4) === debouncedCustomPrice;
+                const negative = parseFloat(row.profit_loss) < 0;
+                const rowBg = row.break_even ? "bg-[#FFF6E3]" : isCustomRow ? "bg-[#F3F5FE]" : negative ? "bg-[#FDFDFC]" : "bg-white";
+                return (
+                  <tr key={row.price} className={`border-b border-[#F0F0ED] last:border-0 ${rowBg}`}>
+                    <td className={`sticky left-0 px-3.5 py-2.5 font-semibold whitespace-nowrap ${rowBg}`}>
+                      {formatMoney(row.price)}
+                      {row.break_even && <span className="ml-1.5 text-[11px] font-bold text-[#8A5A00]">BREAK-EVEN</span>}
+                      {!row.break_even && isCustomRow && (
+                        <span className="ml-1.5 text-[11px] font-bold text-[#2B3EB8]">YOUR PRICE</span>
+                      )}
+                    </td>
+                    <td className="px-3.5 py-2.5 text-right">{formatMoney(row.gross_proceeds)}</td>
+                    <td className="px-3.5 py-2.5 text-right">{formatMoney(row.projected_brokerage)}</td>
+                    <td className="px-3.5 py-2.5 text-right">{formatMoney(row.projected_clearing_fee)}</td>
+                    <td className="px-3.5 py-2.5 text-right">{formatMoney(row.projected_stamp_duty)}</td>
+                    <td className="px-3.5 py-2.5 text-right font-semibold">{formatMoney(row.projected_net_proceeds)}</td>
+                    <td className={`px-3.5 py-2.5 text-right font-bold ${negative ? "text-destructive" : "text-[#177A4E]"}`}>
+                      {formatSignedMoney(row.profit_loss)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* BR-021: required on every page displaying profit/loss. */}
+      <div className="mt-3.5 text-center text-xs text-tertiary">{GENERAL_DISCLAIMER_TEXT}</div>
     </>
   );
 }

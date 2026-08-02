@@ -147,3 +147,24 @@ export interface PortfolioResponse {
   last_price_refresh_at: string | null;
   positions: PositionSummaryResponse[];
 }
+
+export interface SellScenarioRow {
+  price: string;
+  gross_proceeds: string;
+  projected_brokerage: string;
+  projected_clearing_fee: string;
+  projected_stamp_duty: string;
+  projected_all_in_sell_cost: string;
+  projected_net_proceeds: string;
+  profit_loss: string;
+  break_even: boolean;
+}
+
+export interface SellScenarioResponse {
+  position_id: string;
+  shares_to_sell: number;
+  buy_cost_basis: string;
+  broker_id: string;
+  disclaimer_required: boolean;
+  scenarios: SellScenarioRow[];
+}

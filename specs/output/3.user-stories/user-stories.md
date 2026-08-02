@@ -1730,13 +1730,13 @@ Then the break-even row is visually highlighted, the T+2/disclaimer text is perm
 
 **Acceptance Criteria**
 
-- [ ] Disclosure text cannot be dismissed or hidden by the user (BR-020/BR-021 — compliance requirement, not a UX nicety)
-- [ ] Custom price entry adds a row computed via the same endpoint, not a separate client-only formula
-- [ ] Partial-sale slider/input updates all rows' proportional cost basis live
+- [x] Disclosure text cannot be dismissed or hidden by the user (BR-020/BR-021 — compliance requirement, not a UX nicety)
+- [x] Custom price entry adds a row computed via the same endpoint, not a separate client-only formula
+- [x] Partial-sale slider/input updates all rows' proportional cost basis live
 
 **Definition of Done**
 
-- [ ] Verified the disclaimer renders on every result state, including custom-price and partial-sale variants
+- [x] Verified the disclaimer renders on every result state, including custom-price and partial-sale variants
 
 **Dependencies & Integrations**
 
@@ -1745,6 +1745,36 @@ Then the break-even row is visually highlighted, the T+2/disclaimer text is perm
 **Technical Constraints**
 
 - None additional
+
+---
+
+### Implementation Record — FE-4.2
+
+**Design source:** `BursaTrack.dc.html`'s `tabSell` block (the position detail page's third tab, alongside Lots/Dividends) — re-checked via DesignSync (byte length unchanged since FE-2.x) before implementing. Matched the input row layout (shares/broker/custom-price fields + cost-basis summary), the scenario table's 7 columns, and the break-even/custom-price row highlighting (amber `BREAK-EVEN` / blue `YOUR PRICE` labels) exactly. Did **not** replicate the design's own price-ladder generation logic (`base ± 5 cents, then +10..+60 step 5`) — see Deviation 1.
+
+**What was actually built**
+
+- `lib/types.ts` — added `SellScenarioRow`/`SellScenarioResponse`, matching `SellScenarioRowResponse`/`SellScenarioResponse` in `schemas.py`.
+- `hooks/useSellScenario.ts` (new) — SWR wrapper around `GET /positions/{id}/sell-scenario`, keyed on `shares`/`price`/`broker_id` so identical parameter combinations are served from cache rather than re-fetched.
+- `app/positions/[id]/page.tsx` — added a third "Sell Calculator" tab. `SellCalculatorTab` renders: the BR-020 disclosure banner (no dismiss control anywhere in its markup — literally impossible to hide, not just unlikely to be clicked); shares-to-sell / sell-broker / custom-price inputs; a cost-basis-and-break-even summary card; the scenario table with sticky header/first-column and break-even/custom-price row highlighting sourced directly from the API response's own `break_even` flag (no client-side re-derivation); and the BR-021 general disclaimer footer (this page's first tab to display profit/loss, so this is the first place in the app BR-021's "must be permanently visible on every page displaying P/L" requirement actually applies).
+
+**Deviations from the spec/design (deliberate adaptations, not oversights)**
+
+1. **The price ladder is never generated client-side, and never matches the design's own ladder formula.** This story's own AC is explicit: "Custom price entry adds a row computed via the same endpoint, not a separate client-only formula" — read as the general principle that *all* scenario computation, including the default ladder, comes from the backend, not just custom rows. The design's mock (`base ± 5 cents, then +10..+60 step 5`) is a different, narrower ladder than what BE-4.2 already built and BAS-verified (`+0.01..+0.05, then +0.10..+0.70 step 0.05`, no negative offsets — matching the BAS US-015 worked example numerically, already established in BE-4.2's own Implementation Record). The frontend simply renders whatever `scenarios` array the endpoint returns; it has no opinion on the ladder shape at all.
+2. **"Live" partial-sale/custom-price updates are debounced (400ms), not per-keystroke.** The endpoint is rate-limited to 60 requests/minute; a true per-character refetch while typing a multi-digit share count would exhaust that budget in a few seconds of normal typing. A short debounce still reads as "live" (no explicit "Calculate" button — the AC's actual concern) while staying well inside the rate limit.
+3. **The sell-broker dropdown has a synthetic "Default (most recently added lot's broker)" option** (value `""`, no `broker_id` sent) rather than the design's own default of pre-selecting `lots[0].broker` — the design's choice would silently contradict A-006 (BE-4.2's actual default-resolution rule, "most *recently created* active lot's broker," which BE-4.2 already implements and tests). Leaving the override unset and letting the backend resolve A-006 itself is the only way the UI's default and the backend's default can't drift apart.
+4. **The design's `Cost basis is proportional (weighted average). FIFO coming in a future update.` line was kept**, cross-referenced explicitly to BR-024 in the rendered copy, since it's accurate to what BE-4.2 implements and matches this story's own Deviation precedent of keeping design copy that's still factually correct.
+
+**Test evidence**
+
+- `npm run build` and `npm run lint`: clean.
+- Live smoke test against the real backend + Postgres, using the exact query shapes `SellCalculatorTab`/`useSellScenario` construct: default load (`shares=5000`, no overrides) → 19-row-capable response with `broker_id` resolved via A-006; adding `price=10.0000` (the component's custom-price formatting, `Number.toFixed(4)`) → the response includes a `price: "10.0000"` row, confirming the exact string-match the row-highlighting logic depends on (`parseFloat(row.price).toFixed(4) === debouncedCustomPrice`); exactly one `break_even: true` row present at RM8.53; `shares=2000` → `buy_cost_basis` recalculates to RM16,899.15 (BR-024 proportional); `broker_id` override → echoed back unchanged. Test data cleaned up afterward.
+- Confirmed via `npm run build` that the new tab/component introduces no type errors against `PositionResponse`/`BrokerConfigResponse`.
+
+**Known gaps / not yet verified**
+
+- No live browser interaction this session — the actual debounce timing feel, the sticky table header/column behavior on scroll, and the exact visual row-highlighting are the user's manual QA pass, same standing gap as every FE story.
+- No entry point from the dashboard's position rows into this tab (the "Sell Calculator →" row-menu item from the design was deliberately not built in FE-4.1 — see that story's Deviation 3); reaching it requires opening a position and clicking the new tab directly.
 
 ---
 
