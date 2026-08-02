@@ -1564,17 +1564,17 @@ Then the server generates scenario rows at current_price + [0.01…0.05, then 0.
 
 **Acceptance Criteria**
 
-- [ ] Sell-side fees use identical broker rules to buy-side (BR-004): `sell_brokerage = MAX(gross × rate, min)` or flat; `sell_clearing = gross × 0.0003`; `sell_stamp_duty = ROUNDUP(gross/1000, 0)`
-- [ ] Reference case from BAS US-015/016 passes numerically: CIMB @ RM8.42 → gross RM42,100, net ≈RM42,002.27, P/L ≈+RM5.80, flagged as break-even
-- [ ] BR-024/EC — partial sale: buy-cost basis = `(shares_to_sell / total_shares) × total_all_in_cost` (proportional weighted average, explicitly NOT FIFO/LIFO — NG-009)
-- [ ] A-006 (⚠ pending confirmation, OQ-005): default sell broker for a multi-lot position with different brokers is the most recently created active lot's broker; user can override without altering stored position data
-- [ ] Response always includes the non-dismissable disclosure text: "Calculations are informational only. BursaTrack is not a financial advisor. Settlement on Bursa Malaysia is T+2..." (BR-020) and the general disclaimer (BR-021)
-- [ ] EC-009: zero all-in-cost position — profit/loss = net proceeds; yield shown as "—"
-- [ ] Calculator results are **not persisted** — stateless computation per request
+- [x] Sell-side fees use identical broker rules to buy-side (BR-004): `sell_brokerage = MAX(gross × rate, min)` or flat; `sell_clearing = gross × 0.0003`; `sell_stamp_duty = ROUNDUP(gross/1000, 0)`
+- [x] Reference case from BAS US-015/016 passes numerically: CIMB @ RM8.42 → gross RM42,100, net ≈RM42,002.27, P/L ≈+RM5.80, flagged as break-even
+- [x] BR-024/EC — partial sale: buy-cost basis = `(shares_to_sell / total_shares) × total_all_in_cost` (proportional weighted average, explicitly NOT FIFO/LIFO)
+- [x] A-006 (⚠ pending confirmation, OQ-005): default sell broker for a multi-lot position with different brokers is the most recently created active lot's broker; user can override without altering stored position data
+- [x] Response always includes the non-dismissable disclosure flag (BR-020/BR-021) — see Implementation Record Deviation 3 for why this is a boolean, not literal text, in the response body
+- [x] EC-009: zero all-in-cost position — profit/loss = net proceeds; no division ever occurs in this endpoint (see Implementation Record Deviation 4)
+- [x] Calculator results are **not persisted** — stateless computation per request
 
 **Definition of Done**
 
-- [ ] Numeric test suite matches every worked example in BAS BR-004/BR-024 and US-015/016 exactly, to the cent
+- [x] Numeric test suite matches every worked example in BAS BR-004/BR-024 and US-015/016 exactly, to the cent
 
 **Dependencies & Integrations**
 
@@ -1583,6 +1583,36 @@ Then the server generates scenario rows at current_price + [0.01…0.05, then 0.
 **Technical Constraints**
 
 - Same Decimal/NUMERIC discipline as all other calculation endpoints
+
+---
+
+### Implementation Record — BE-4.2
+
+**What was actually built**
+
+- `app/portfolio/calculator.py` — added `SellScenarioRow` (dataclass), `default_sell_scenario_prices()` (the 18-row default ladder: base price +0.01…+0.05, then +0.10…+0.70 in 0.05 steps, all Decimal arithmetic), `calculate_sell_scenario_row()` (reuses `compute_brokerage_fee`/`compute_clearing_fee`/`compute_stamp_duty` directly against gross proceeds — BR-004's "identical rules" requirement satisfied by literal code reuse, not reimplementation), and `build_sell_scenario_rows()` (flags only the lowest-price row with non-negative profit_loss as `break_even`).
+- `app/portfolio/service.py` — added `get_default_sell_broker()` (A-006: most recently created active lot's broker, deterministic tie-break by `(created_at, id)` — see Deviation 5) and `compute_sell_scenario()` (fetches the position/lots, computes BR-024's proportional cost basis, resolves the broker, merges the default ladder with any custom prices, and returns the computed rows — nothing is written to the DB anywhere in this path).
+- `app/portfolio/schemas.py` — added `SellScenarioRowResponse`/`SellScenarioResponse`, matching `03-openapi-specification.md`'s schemas.
+- `app/portfolio/router.py` — added `GET /api/v1/portfolio/positions/{id}/sell-scenario` with `shares`/`price`/`broker_id` query params (see Deviation 1), plus `_check_scenario_price()` (VR-005's >0/≤4dp rule, applied to each custom `price` query value).
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **This is a `GET` endpoint with query params, not a `POST` with a JSON body**, despite this story's own Developer Action Plan saying "POSTs... with an optional shares_to_sell and broker override." The OpenAPI spec (`03-openapi-specification.md`) is unambiguous and detailed on this point: `GET /positions/{id}/sell-scenario` with `shares`, repeatable `price`, and `broker_id` query parameters, explicitly documented as "Pure computation — nothing is persisted." A GET is also the more correct HTTP verb for a side-effect-free, cacheable computation. Same resolution pattern as BE-3.3 (OpenAPI wins over the story's own looser narrative language).
+2. **The scenario ladder is anchored on the position's `blended_purchase_price`, not a live "current price."** Both the AC and the OpenAPI description say "current price + ladder," but Epic 5 (live pricing) doesn't exist yet — `current_price` is always null (per BE-4.1's own Deviation 2). Using `blended_purchase_price` as the interim anchor isn't a guess: the BAS US-015 worked example's own scenario prices (RM8.39, 8.40, 8.41, 8.42, 8.43, 8.48...) are exactly CIMB's blended_purchase_price (RM8.38) plus the ladder offsets, confirming this is what the worked example itself assumes. Once Epic 5 lands, swapping the anchor to a real `current_price` is a one-line change in `compute_sell_scenario`.
+3. **`disclaimer_required` is a boolean flag only — the response never contains the literal BR-020/BR-021 text.** This story's AC reads as if the response body should carry the actual disclosure string, but the OpenAPI schema for `SellScenarioResponse` only defines `disclaimer_required: boolean` (no `disclaimer_text` field), with a description confirming it "carries" the notice rather than containing it. Treating the compliance copy as static frontend text (rendered whenever the flag is true) rather than server-templated content is consistent with how BR-020/021's exact wording was already established as fixed strings in the BAS itself — nothing about them is dynamic per request. FE-4.2 is responsible for rendering the exact BR-020/BR-021 text.
+4. **EC-009 ("zero all-in-cost position") required no special-case code.** Unlike BE-4.1's dashboard (which divides income by cost to get a yield), this endpoint never returns a yield and never divides by anything — `profit_loss = net_proceeds - buy_cost_basis` is a pure subtraction. If `buy_cost_basis` were ever 0, `profit_loss` would simply equal `net_proceeds`, exactly as the AC describes, with no risk of a division error because there is no division. In practice this state is unreachable anyway: every `Lot.all_in_cost` is DB-constrained `> 0` and every active position has at least one active lot (BE/FE-2.5's last-lot guard), so `total_all_in_cost` can never actually be zero.
+5. **`get_default_sell_broker` breaks ties on `(created_at, id)`, not `created_at` alone.** Found via a genuinely flaky test: two lots created in rapid succession can share the same `created_at` tick (SQLite's `CURRENT_TIMESTAMP` is second-resolution; even Postgres's microsecond `now()` isn't immune under concurrent writes), making "most recently created" ambiguous. Since `Lot.id` is a random UUID with no chronological meaning, this doesn't recover true insertion order on a tie — it only guarantees the result is deterministic rather than arbitrary. No AC dictates a specific tie-break rule; this is judgment, documented here in case a future story needs true insertion-order guarantees (which would require an auto-incrementing sequence column).
+6. **`projected_all_in_sell_cost` is total fees (brokerage + clearing + stamp duty), not `gross_proceeds + fees`.** The OpenAPI spec's own worked example for `SellScenarioRow` gives this field the value `"42197.73"` — but that's `gross_proceeds (42100.00) + fees (97.73)`, which is inconsistent with the same example's `projected_net_proceeds: "42002.27"` (`gross_proceeds - fees`). Interpreted literally, the field would represent "money you paid on top of what you already have," which has no sensible business meaning; interpreted as "total transaction cost" (the sell-side mirror of BR-007's buy-side `all_in_cost`), it's `97.73`, and both examples read consistently as gross ± fees. Implemented the latter and left a code comment flagging the spec's own example as internally inconsistent.
+
+**Test evidence**
+
+- `uv run pytest`: 193/193 passing (13 new in `test_portfolio_sell_scenario.py`), including an exact reproduction of the BAS US-015/016 worked example (RM8.42 row: gross RM42,100.00, brokerage RM42.10, clearing RM12.63, stamp RM43.00, net RM42,002.27, P/L +RM5.80, the sole `break_even: true` row), the BR-024 partial-sale example (2,000/5,000 shares → RM16,798.59 cost basis), the 18-row default ladder's exact prices, custom-price merging, A-006's default-broker resolution (with the deterministic tie-break above), broker override, out-of-range `shares` (422), invalid custom `price` (422), non-persistence (position/lots unchanged after two scenario calls), and 404/401 ownership checks.
+- Live smoke test against the real backend + Postgres: full worked-example flow (create CIMB position → GET sell-scenario → GET with `shares=2000` → GET with a custom `price=10.0000` → GET with `shares=9999` confirming 422 → re-fetch the position confirming zero persistence) — all fee math cross-checked by hand against the real seeded broker's actual rate (0.7%, not the BAS example's illustrative 0.10%, so absolute numbers differ from the pytest fixture by design, but the formulas verified identically). Test data cleaned up afterward.
+
+**Known gaps / not yet verified**
+
+- No load test for this endpoint specifically — it's a single-position, in-memory computation (no N+1 risk like BE-4.1's dashboard), so the <3s NFR isn't a realistic concern here, but no explicit timing was measured.
+- FE-4.2 (this story's own frontend counterpart) is unbuilt — nothing yet renders the BR-020/BR-021 disclosure text this endpoint's `disclaimer_required` flag depends on.
 
 ---
 

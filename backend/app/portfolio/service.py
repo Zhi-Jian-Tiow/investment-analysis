@@ -20,7 +20,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.service import record_audit_event
 from app.errors import last_lot_cannot_be_deleted, not_found, validation_error, version_conflict
-from app.portfolio.calculator import calculate_lot_fees, is_non_trading_day, round_myr
+from app.portfolio.calculator import (
+    build_sell_scenario_rows,
+    calculate_lot_fees,
+    default_sell_scenario_prices,
+    is_non_trading_day,
+    round_myr,
+)
+from app.portfolio.calculator import SellScenarioRow as CalculatedSellScenarioRow
 from app.portfolio.models import BrokerConfig, DividendTranche, Lot, Portfolio, Position
 from app.portfolio.schemas import (
     CreateDividendRequest,
@@ -850,3 +857,97 @@ async def get_dividend_calendar(db: AsyncSession, portfolio_id: uuid.UUID, year:
     # OpenAPI: "ascending by ex_dividend_date (falling back to payment_date)".
     entries.sort(key=lambda e: e.tranche.ex_dividend_date or e.tranche.payment_date)
     return entries
+
+
+async def get_default_sell_broker(db: AsyncSession, position_id: uuid.UUID) -> BrokerConfig:
+    """A-006 (⚠ OQ-005 pending confirmation): defaults to the most recently
+    created active lot's broker for this position. Every active position has
+    at least one active lot (BE/FE-2.5's last-lot guard), so this always
+    resolves.
+
+    Orders by (created_at, id) rather than created_at alone: two lots
+    created within the same timestamp tick (SQLite's CURRENT_TIMESTAMP is
+    second-resolution; Postgres's now() is microsecond but not immune under
+    concurrent writes) would otherwise tie-break arbitrarily. UUIDs carry no
+    chronological meaning, so this doesn't guarantee true insertion order on
+    a tie — it only guarantees the result is deterministic and reproducible.
+    """
+    result = await db.execute(
+        select(Lot)
+        .where(Lot.position_id == position_id, Lot.is_deleted.is_(False))
+        .order_by(Lot.created_at.desc(), Lot.id.desc())
+        .limit(1)
+    )
+    lot = result.scalar_one()
+    broker = await get_broker(db, lot.broker_config_id)
+    assert broker is not None, "a lot's broker_config_id must reference an existing BrokerConfig"
+    return broker
+
+
+class SellScenarioResult(NamedTuple):
+    position: Position
+    shares_to_sell: int
+    buy_cost_basis: Decimal
+    broker: BrokerConfig
+    rows: list[CalculatedSellScenarioRow]
+
+
+async def compute_sell_scenario(
+    db: AsyncSession,
+    portfolio_id: uuid.UUID,
+    position_id: uuid.UUID,
+    *,
+    shares_to_sell: int | None,
+    custom_prices: list[Decimal],
+    broker_id: uuid.UUID | None,
+) -> SellScenarioResult:
+    """BE-4.2. Pure/stateless — nothing is persisted (this story's own AC).
+
+    `base_price` (the ladder's anchor) uses the position's own
+    blended_purchase_price, not a live "current price" — Epic 5 (pricing)
+    doesn't exist yet. See this story's Implementation Record.
+    """
+    position = await get_owned_active_position(db, portfolio_id, position_id)
+    lots = await get_position_lots(db, position.id)
+    total_shares, total_all_in_cost, blended_purchase_price = position_aggregates(lots)
+
+    effective_shares = shares_to_sell if shares_to_sell is not None else total_shares
+    if effective_shares < 1 or effective_shares > total_shares:
+        raise validation_error(
+            "One or more fields failed validation.",
+            fields=[
+                {
+                    "field": "shares",
+                    "constraint": f"Shares to sell must be between 1 and the position's current total shares ({total_shares:,})",
+                    "received": str(effective_shares),
+                }
+            ],
+        )
+
+    # BR-024: proportional weighted-average cost basis (not FIFO/LIFO).
+    buy_cost_basis = (
+        round_myr((Decimal(effective_shares) / Decimal(total_shares)) * total_all_in_cost)
+        if total_shares
+        else Decimal("0.00")
+    )
+
+    if broker_id is not None:
+        broker = await get_broker(db, broker_id)
+        if broker is None:
+            raise validation_error(
+                "One or more fields failed validation.",
+                fields=[{"field": "broker_id", "constraint": "No broker exists with this ID", "received": str(broker_id)}],
+            )
+    else:
+        broker = await get_default_sell_broker(db, position.id)
+
+    default_prices = default_sell_scenario_prices(blended_purchase_price)
+    # Merge default ladder + custom prices, de-duplicated, ascending — so
+    # "lowest break-even row" is well-defined across the combined set.
+    merged_prices = sorted({p for p in default_prices} | {p for p in custom_prices})
+
+    rows = build_sell_scenario_rows(merged_prices, effective_shares, buy_cost_basis, broker)
+
+    return SellScenarioResult(
+        position=position, shares_to_sell=effective_shares, buy_cost_basis=buy_cost_basis, broker=broker, rows=rows
+    )

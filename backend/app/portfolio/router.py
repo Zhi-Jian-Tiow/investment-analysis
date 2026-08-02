@@ -1,5 +1,5 @@
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, status
@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import get_current_user, get_current_user_optional
 from app.auth.models import User
 from app.database import get_db
+from app.errors import validation_error
 from app.rate_limit import limiter
 
 from app.portfolio.models import DividendTranche, Lot, Position
@@ -24,12 +25,15 @@ from app.portfolio.schemas import (
     PortfolioResponse,
     PositionResponse,
     PositionSummaryResponse,
+    SellScenarioResponse,
+    SellScenarioRowResponse,
     UpdateDividendRequest,
     UpdateLotRequest,
     UpdatePositionRequest,
 )
 from app.portfolio.service import (
     add_lot_to_position,
+    compute_sell_scenario,
     create_dividend_tranche,
     create_position,
     delete_dividend_tranche,
@@ -226,6 +230,80 @@ async def get_position(
     tranches = await get_position_dividend_tranches(db, position.id)
 
     return _build_position_response(position, lots, tranches)
+
+
+def _check_scenario_price(raw: str) -> Decimal:
+    """Same VR-005 rule as purchase_price (>0, at most 4dp) — the `price`
+    query param uses the identical BR-026 per-share precision convention.
+    """
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        raise validation_error(
+            "One or more fields failed validation.",
+            fields=[{"field": "price", "constraint": "Price must be a valid decimal number", "received": raw}],
+        )
+    if value <= 0:
+        raise validation_error(
+            "One or more fields failed validation.",
+            fields=[{"field": "price", "constraint": "Price must be greater than zero", "received": raw}],
+        )
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -4:
+        raise validation_error(
+            "One or more fields failed validation.",
+            fields=[{"field": "price", "constraint": "Price can have at most 4 decimal places", "received": raw}],
+        )
+    return value
+
+
+@router.get("/portfolio/positions/{position_id}/sell-scenario", response_model=SellScenarioResponse)
+@limiter.limit("60/minute")
+async def get_sell_scenario(
+    request: Request,
+    position_id: UUID,
+    shares: int | None = Query(None, ge=1),
+    price: list[str] | None = Query(None),
+    broker_id: UUID | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> SellScenarioResponse:
+    """BE-4.2. Pure computation, nothing persisted. See compute_sell_scenario
+    for the BR-024 partial-sale cost basis and A-006 default-broker logic.
+    """
+    portfolio = await get_portfolio_for_user(db, current_user.id)
+    custom_prices = [_check_scenario_price(raw) for raw in (price or [])]
+
+    result = await compute_sell_scenario(
+        db,
+        portfolio.id,
+        position_id,
+        shares_to_sell=shares,
+        custom_prices=custom_prices,
+        broker_id=broker_id,
+    )
+
+    return SellScenarioResponse(
+        position_id=result.position.id,
+        shares_to_sell=result.shares_to_sell,
+        buy_cost_basis=result.buy_cost_basis,
+        broker_id=result.broker.id,
+        disclaimer_required=True,
+        scenarios=[
+            SellScenarioRowResponse(
+                price=row.price,
+                gross_proceeds=row.gross_proceeds,
+                projected_brokerage=row.brokerage_fee,
+                projected_clearing_fee=row.clearing_fee,
+                projected_stamp_duty=row.stamp_duty,
+                projected_all_in_sell_cost=row.all_in_sell_cost,
+                projected_net_proceeds=row.net_proceeds,
+                profit_loss=row.profit_loss,
+                break_even=row.break_even,
+            )
+            for row in result.rows
+        ],
+    )
 
 
 @router.patch("/portfolio/positions/{position_id}", response_model=PositionResponse)

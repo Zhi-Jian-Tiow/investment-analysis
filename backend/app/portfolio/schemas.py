@@ -466,3 +466,39 @@ class PositionResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     warnings: list[str] = Field(default_factory=list)
+
+
+class SellScenarioRowResponse(BaseModel):
+    """Matches components/schemas/SellScenarioRow in
+    03-openapi-specification.md. `projected_all_in_sell_cost` is total fees
+    (brokerage + clearing + stamp duty), not gross_proceeds + fees — see
+    calculate_sell_scenario_row's docstring for why the spec's own worked
+    example for this field isn't reproduced literally."""
+
+    price: Decimal
+    gross_proceeds: Decimal
+    projected_brokerage: Decimal
+    projected_clearing_fee: Decimal
+    projected_stamp_duty: Decimal
+    projected_all_in_sell_cost: Decimal
+    projected_net_proceeds: Decimal
+    profit_loss: Decimal
+    break_even: bool
+
+
+class SellScenarioResponse(BaseModel):
+    """Matches components/schemas/SellScenarioResponse in
+    03-openapi-specification.md. `disclaimer_required` is a boolean flag
+    only (no `disclaimer_text` field in the OpenAPI schema) — BR-020/BR-021's
+    actual disclosure copy is static compliance text the frontend renders
+    whenever this is true, not server-templated content. See BE-4.2's
+    Implementation Record for the full reasoning (this story's own AC text
+    reads as if the literal string should be in the response body).
+    """
+
+    position_id: UUID
+    shares_to_sell: int
+    buy_cost_basis: Decimal
+    broker_id: UUID
+    disclaimer_required: bool = True
+    scenarios: list[SellScenarioRowResponse]
