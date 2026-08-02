@@ -13,6 +13,16 @@
 
 import Decimal from "decimal.js";
 
+import type { LotResponse } from "@/lib/types";
+
+/** BR-027: qualifying_shares represents shares held before the ex-dividend
+ * date — a lot purchased after that date could not have qualified. Mirrors
+ * backend/app/portfolio/service.py::shares_eligible_as_of exactly (plain
+ * ISO-string comparison, since both sides use YYYY-MM-DD). */
+export function sharesEligibleAsOf(lots: LotResponse[], referenceDate: string): number {
+  return lots.filter((lot) => lot.purchase_date <= referenceDate).reduce((sum, lot) => sum + lot.shares, 0);
+}
+
 function roundMyr(value: Decimal): Decimal {
   // BR-025: round half away from zero to 2dp.
   return value.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);

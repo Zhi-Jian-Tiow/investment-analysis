@@ -10,13 +10,30 @@ export function validatePerShareAmount(value: string): string | null {
   return null;
 }
 
-export function validateQualifyingShares(value: string, positionTotalShares: number): string | null {
+/**
+ * `eligibleShares` — shares_eligible_as_of the tranche's ex-date (falling
+ * back to payment date), NOT the position's live total; see
+ * lib/dividend-calculator.ts::sharesEligibleAsOf. Mirrors the backend's
+ * dual-message behavior exactly: when eligibleShares === positionTotalShares
+ * (no lot postdates the reference date — the common case), uses BAS
+ * US-012's exact mandated copy verbatim; only the date-restricted case gets
+ * the more specific message.
+ */
+export function validateQualifyingShares(
+  value: string,
+  eligibleShares: number,
+  positionTotalShares: number,
+  referenceDate: string
+): string | null {
   if (!value.trim()) return "Qualifying shares is required";
   if (!/^\d+$/.test(value.trim())) return "Qualifying shares must be a whole number";
   const n = parseInt(value, 10);
   if (n < 1) return "Qualifying shares must be at least 1";
-  if (n > positionTotalShares) {
-    return `Qualifying shares cannot exceed the position's current total shares (${positionTotalShares.toLocaleString("en-MY")})`;
+  if (n > eligibleShares) {
+    if (eligibleShares === positionTotalShares) {
+      return `Qualifying shares cannot exceed the position's current total shares (${positionTotalShares.toLocaleString("en-MY")})`;
+    }
+    return `Qualifying shares cannot exceed the shares held as of ${referenceDate} (${eligibleShares.toLocaleString("en-MY")}) — ${(positionTotalShares - eligibleShares).toLocaleString("en-MY")} more shares were purchased after this date`;
   }
   return null;
 }

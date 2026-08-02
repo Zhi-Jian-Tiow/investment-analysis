@@ -1155,6 +1155,24 @@ Then the server stores qualifying_shares and computes total_amount = per_share_a
 - No live browser interaction (no FE-3.x work exists yet — that's FE-3.1's own story).
 - No CI/code-review-gate tooling exists in this project to mechanically enforce the DoD's "any PR touching total_amount must be reviewed against BR-009/BR-027" — the model's own docstring is the current substitute.
 
+**Post-implementation correction — qualifying_shares bound ignored lot purchase dates (VR-011)**
+
+User-reported via manual QA, two symptoms of the same root cause:
+1. A dividend could be logged with a `payment_date` earlier than the position's own lot(s) — nonsensical, since you can't receive a dividend on shares you didn't yet own.
+2. A position with lot 1 (1,000 shares, bought 1 Jul) and lot 2 (3,000 shares, bought 31 Jul) allowed a dividend dated 15 Jul to claim up to 4,000 `qualifying_shares` — but only lot 1 existed as of 15 Jul, so the true maximum was 1,000.
+
+Root cause: `_check_qualifying_shares_bound` validated against `position_total_shares` — the position's *live* total across every lot regardless of purchase date — not against what BR-027 actually defines `qualifying_shares` to mean ("shares held before the ex-dividend date"). The original BAS text (BR-027's own worked example) anticipated this exact scenario but left it to user judgment ("the user should override qualifying_shares") rather than a hard server-side constraint; the user directed that this now be enforced automatically instead.
+
+Fixed by adding `shares_eligible_as_of(lots, reference_date)` (`service.py`) — sums only lots whose `purchase_date <= reference_date`, where `reference_date` is `ex_dividend_date` falling back to `payment_date` (the same fallback already used everywhere else for this pair — BE-3.3's `is_upcoming`/sort). `_check_qualifying_shares_bound` now takes this eligible count as its upper bound instead of the live position total. This closes bug 1 for free: a reference date before every lot yields `eligible_shares = 0`, and `qualifying_shares >= 1` (already enforced at the schema level) can never satisfy that, so the request is rejected outright. Applied identically to `create_dividend_tranche` (BE-3.1) and `update_dividend_tranche` (BE-3.2, below) — an edit that moves a tranche's date earlier now re-tightens the bound even if the original value was valid when first logged.
+
+BAS US-012's exact mandated error copy ("Qualifying shares cannot exceed the position's current total shares (N)") is preserved verbatim for the common case where no lot postdates the reference date (`eligible_shares == position_total_shares`); only the newly-restricted case gets a new, more specific message ("...cannot exceed the shares held as of {date} (N) — M more shares were purchased after this date").
+
+Mirrored client-side too (not just the backend): `sharesEligibleAsOf()` (`lib/dividend-calculator.ts`) and an updated `validateQualifyingShares()` signature (`lib/dividend-validation.ts`), wired into both `AddDividendDialog` and `EditDividendDialog` so the inline error appears before a round-trip, not just as a server rejection after Save.
+
+Four pre-existing tests (`test_add_dividend_rejects_ninth_tranche_in_same_year_br014`, `test_add_dividend_allows_same_label_in_different_years`, `test_edit_dividend_moving_year_revalidates_br014_cap`, `test_edit_dividend_tranche_label_rejects_duplicate_in_same_year`) used 2025 payment dates against a fixture position purchased in 2026, purely to exercise BR-014's year-cap logic — a latent test-data mismatch this fix now surfaces. Fixed by adding an optional `purchase_date` override to each file's `_create_position` helper and back-dating those four tests' positions to 2020.
+
+Added 5 new backend tests (`test_add_dividend_exact_copy_when_eligible_equals_current_total`, `test_add_dividend_qualifying_shares_bounded_by_shares_owned_as_of_reference_date`, `test_add_dividend_uses_ex_date_not_payment_date_for_eligibility`, `test_add_dividend_rejects_reference_date_before_any_lot`, `test_edit_dividend_qualifying_shares_bounded_by_shares_owned_as_of_reference_date`) reproducing both reported scenarios plus the ex-date-vs-payment-date fallback and the exact-copy preservation case. Full suite: 198/198 passing. `npm run build`/`lint`: clean. Re-verified live against the real backend: both original bug scenarios now return 422 with the correct message, and the corrected 1,000-share submission returns 201.
+
 ---
 
 ## BE-3.2 — Edit / Delete Dividend Tranche
@@ -1477,6 +1495,19 @@ The first pass added an ad-hoc "Calendar" text link to `dashboard/page.tsx`'s ow
 
 - No live browser interaction this session — actual rendering at a 375px viewport, the amber highlight/badge styling, and the new "Calendar" header link are the user's manual QA pass, same standing gap as every FE story.
 - No year switcher — only the current calendar year is viewable (see Deviation 1). Adding one is natural follow-up scope if the user wants historical years browsable, but nothing in this story's AC requires it.
+
+**Post-implementation correction — "Upcoming" wrongly excluded due-soon tranches**
+
+User-reported via manual QA: a tranche logged with no `ex_dividend_date` and a `payment_date` within 7 days appeared only in "Due in the next 7 days," never in "Upcoming" — but the same tranche logged *with* an ex-date (and therefore not always caught by the 7-day window on `ex_dividend_date`) did appear in "Upcoming." Root cause: `upcoming` was filtered as `!t.is_paid && !t.is_upcoming` — an exclusive partition against `dueSoon` (`t.is_upcoming`). Since BE-3.3's `is_upcoming` falls back to `payment_date` when `ex_dividend_date` is null (same fallback the sort order already uses), a no-ex-date tranche due soon got flagged `is_upcoming: true` and was silently dropped from `upcoming`.
+
+The design's own mock (`due7`/`calUpcoming` in `BursaTrack.dc.html`) computes these as two **independent** filters over the same `entries` array, not a partition — a due-soon entry is expected to appear in both the highlight cards *and* the full list below. Fixed by changing `upcoming` to `tranches.filter(t => !t.is_paid)` (dropping the `!t.is_upcoming` exclusion), matching the design's overlapping-sets behavior and this story's own AC intent that every unpaid tranche appears in "Upcoming." Re-verified live against the real backend: a no-ex-date tranche due in 3 days now returns `is_paid: false, is_upcoming: true` and correctly lands in both `dueSoon` and `upcoming`.
+
+**Post-implementation correction — "Upcoming" sort order and section removal**
+
+Two further user-reported fixes from the same manual QA pass:
+
+1. **`upcoming` and `dueSoon` weren't sorted by payment date.** They inherited `tranches`' own backend order (ascending by `ex_dividend_date` falling back to `payment_date` — BE-3.3's sort), which is a different key than "payout date" when a tranche has an ex-date well before its payment date. Fixed by explicitly sorting both `.sort((a, b) => a.payment_date < b.payment_date ? -1 : 1)` — the next immediate payout is always first, regardless of ex-date.
+2. **The "Due in the next 7 days" section was removed entirely** (the user's own decision after further inspection, made directly in `calendar/page.tsx`) — the calendar page is now just the two-column "Upcoming"/"Recently paid" layout, both sorted ascending/descending by `payment_date` respectively. `dueSoon`, its amber card grid, and the now-unused `is_upcoming`-driven highlight logic were all deleted; `upcoming` (`!t.is_paid`, sorted by `payment_date`) is the only "not yet paid" view now. `DividendCalendarEntry.is_upcoming` is still returned by the backend (BE-3.3) but no longer consumed by this page.
 
 ---
 

@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, apiFetch } from "@/lib/api";
-import { computeDividendTotal, computeYieldPercent, formatPercent } from "@/lib/dividend-calculator";
+import { computeDividendTotal, computeYieldPercent, formatPercent, sharesEligibleAsOf } from "@/lib/dividend-calculator";
 import {
   validateDividendPaymentDate,
   validateExDividendDate,
@@ -83,6 +83,12 @@ export function AddDividendDialog({
   const qualifyingSharesDiffers =
     qualifyingShares !== "" && parseInt(qualifyingShares, 10) !== position.total_shares;
 
+  // BR-027: bounded by shares owned as of the ex-date (falling back to
+  // payment date) — not the position's live total, which would let a lot
+  // purchased after this dividend's reference date count toward it.
+  const referenceDate = exDividendDate || paymentDate;
+  const eligibleShares = sharesEligibleAsOf(position.lots, referenceDate);
+
   function resetForm() {
     setPerShareAmount("");
     setQualifyingShares(String(position.total_shares));
@@ -95,7 +101,8 @@ export function AddDividendDialog({
   function validate(): boolean {
     const next: FieldErrors = {
       perShareAmount: validatePerShareAmount(perShareAmount) ?? undefined,
-      qualifyingShares: validateQualifyingShares(qualifyingShares, position.total_shares) ?? undefined,
+      qualifyingShares:
+        validateQualifyingShares(qualifyingShares, eligibleShares, position.total_shares, referenceDate) ?? undefined,
       paymentDate: validateDividendPaymentDate(paymentDate) ?? undefined,
       exDividendDate: validateExDividendDate(exDividendDate, paymentDate) ?? undefined,
     };

@@ -26,7 +26,7 @@ async def _percentage_broker(db_session, rate="0.001", minimum_fee="8.00") -> Br
     return broker
 
 
-async def _create_position(client, broker, *, stock_code="1023", shares=5000, purchase_price="8.3800"):
+async def _create_position(client, broker, *, stock_code="1023", shares=5000, purchase_price="8.3800", purchase_date="2026-01-15"):
     resp = await client.post(
         "/api/v1/portfolio/positions",
         json={
@@ -35,7 +35,7 @@ async def _create_position(client, broker, *, stock_code="1023", shares=5000, pu
             "shares": shares,
             "purchase_price": purchase_price,
             "broker_id": str(broker.id),
-            "purchase_date": "2026-01-15",
+            "purchase_date": purchase_date,
         },
     )
     assert resp.status_code == 201
@@ -117,6 +117,39 @@ async def test_edit_qualifying_shares_exceeding_position_total_rejected_with_exa
     body = resp.json()
     field = next(f for f in body["fields"] if f["field"] == "qualifying_shares")
     assert field["constraint"] == "Qualifying shares cannot exceed the position's current total shares (5,000)"
+
+
+@pytest.mark.asyncio
+async def test_edit_dividend_qualifying_shares_bounded_by_shares_owned_as_of_reference_date(
+    client, seeded_broker, db_session
+):
+    """Same reported bug as create, exercised via edit: moving a tranche's
+    payment_date earlier than a later lot must re-tighten the qualifying_shares
+    bound, even if the value being submitted was valid when the tranche was
+    first logged."""
+    await _register(client, seeded_broker)
+    broker = await _percentage_broker(db_session)
+    position = await _create_position(client, broker, shares=1000, purchase_date="2026-07-01")
+    tranche = await _log_dividend(
+        client, position["id"], qualifying_shares=1000, payment_date="2026-08-15", ex_dividend_date=None
+    )
+    await client.post(
+        f"/api/v1/portfolio/positions/{position['id']}/lots",
+        json={"shares": 3000, "purchase_price": "8.3800", "broker_id": str(broker.id), "purchase_date": "2026-07-31"},
+    )
+
+    # Now valid against the live total (4,000), but not as of the new, earlier date.
+    resp = await client.patch(
+        f"/api/v1/portfolio/dividends/{tranche['id']}",
+        json={"qualifying_shares": 4000, "payment_date": "2026-07-15", "version": 1},
+    )
+
+    assert resp.status_code == 422
+    field = next(f for f in resp.json()["fields"] if f["field"] == "qualifying_shares")
+    assert field["constraint"] == (
+        "Qualifying shares cannot exceed the shares held as of 2026-07-15 (1,000) — "
+        "3,000 more shares were purchased after this date"
+    )
 
 
 # ---------- Optimistic locking (EX-008) ----------
@@ -215,7 +248,8 @@ async def test_edit_dividend_requires_authentication(client, seeded_broker, db_s
 async def test_edit_dividend_moving_year_revalidates_br014_cap(client, seeded_broker, db_session):
     await _register(client, seeded_broker)
     broker = await _percentage_broker(db_session)
-    position = await _create_position(client, broker)
+    # Lot must predate the 2025 payment dates below.
+    position = await _create_position(client, broker, purchase_date="2020-01-15")
 
     # Fill 2025 with 8 tranches.
     for i, label in enumerate(["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th"]):
@@ -255,7 +289,8 @@ async def test_edit_dividend_allows_changing_own_year_without_self_counting(clie
 async def test_edit_dividend_tranche_label_rejects_duplicate_in_same_year(client, seeded_broker, db_session):
     await _register(client, seeded_broker)
     broker = await _percentage_broker(db_session)
-    position = await _create_position(client, broker)
+    # Lot must predate the 2026-01-01 payment date below.
+    position = await _create_position(client, broker, purchase_date="2020-01-15")
     await _log_dividend(client, position["id"], tranche_label="1st", payment_date="2026-01-01", ex_dividend_date=None)
     second = await _log_dividend(
         client, position["id"], tranche_label="2nd", payment_date="2026-02-01", ex_dividend_date=None

@@ -181,6 +181,18 @@ def position_aggregates(lots: list[Lot]) -> tuple[int, Decimal, Decimal]:
     return total_shares, total_all_in_cost, blended_purchase_price
 
 
+def shares_eligible_as_of(lots: list[Lot], reference_date: date) -> int:
+    """BR-027: qualifying_shares represents "shares held before the
+    ex-dividend date" — a lot purchased after that date could not possibly
+    have qualified. Sums only lots whose purchase_date is on or before
+    `reference_date` (the tranche's ex_dividend_date, falling back to
+    payment_date, same fallback used everywhere else for this pair — BE-3.3's
+    is_upcoming/sort). A reference_date earlier than every lot's purchase_date
+    correctly yields 0.
+    """
+    return sum((lot.shares for lot in lots if lot.purchase_date <= reference_date), 0)
+
+
 async def get_owned_active_position(db: AsyncSession, portfolio_id: uuid.UUID, position_id: uuid.UUID) -> Position:
     """Ownership check returns 404, never 403, whether the position doesn't
     exist, belongs to another user, or has been soft-deleted (BAS §9
@@ -575,19 +587,36 @@ def position_dividend_income_ytd(tranches: list[DividendTranche]) -> Decimal:
     )
 
 
-def _check_qualifying_shares_bound(qualifying_shares: int, position_total_shares: int) -> None:
-    # VR-011 — shared by create (BE-3.1) and edit (BE-3.2, the "on edit" clause).
-    if qualifying_shares > position_total_shares:
-        raise validation_error(
-            "One or more fields failed validation.",
-            fields=[
-                {
-                    "field": "qualifying_shares",
-                    "constraint": f"Qualifying shares cannot exceed the position's current total shares ({position_total_shares:,})",
-                    "received": str(qualifying_shares),
-                }
-            ],
+def _check_qualifying_shares_bound(
+    qualifying_shares: int, eligible_shares: int, position_total_shares: int, reference_date: date
+) -> None:
+    """VR-011 — shared by create (BE-3.1) and edit (BE-3.2, the "on edit"
+    clause). Bounded by `eligible_shares` (shares_eligible_as_of the
+    tranche's ex-date/payment-date), not the position's live total — a lot
+    purchased after that date was never eligible for this dividend, however
+    many shares the position holds today. This also makes a reference_date
+    that predates every lot self-rejecting (eligible_shares = 0), closing the
+    "logged a dividend dated before I owned any shares" gap.
+
+    When eligible_shares == position_total_shares (the common case — no lot
+    was purchased after the reference date), uses BAS US-012's exact
+    mandated error copy verbatim. Only the date-restricted case gets the
+    newer, more specific message, so the spec's literal string is preserved
+    everywhere it was written to apply.
+    """
+    if qualifying_shares <= eligible_shares:
+        return
+    if eligible_shares == position_total_shares:
+        constraint = f"Qualifying shares cannot exceed the position's current total shares ({position_total_shares:,})"
+    else:
+        constraint = (
+            f"Qualifying shares cannot exceed the shares held as of {reference_date.isoformat()} "
+            f"({eligible_shares:,}) — {position_total_shares - eligible_shares:,} more shares were purchased after this date"
         )
+    raise validation_error(
+        "One or more fields failed validation.",
+        fields=[{"field": "qualifying_shares", "constraint": constraint, "received": str(qualifying_shares)}],
+    )
 
 
 def _check_tranche_year_constraints(
@@ -632,7 +661,9 @@ async def create_dividend_tranche(
 
     lots = await get_position_lots(db, position.id)
     position_total_shares, _, _ = position_aggregates(lots)
-    _check_qualifying_shares_bound(data.qualifying_shares, position_total_shares)
+    reference_date = data.ex_dividend_date or data.payment_date
+    eligible_shares = shares_eligible_as_of(lots, reference_date)
+    _check_qualifying_shares_bound(data.qualifying_shares, eligible_shares, position_total_shares, reference_date)
 
     existing_tranches = await get_position_dividend_tranches(db, position.id)
     tranches_for_year = [t for t in existing_tranches if t.year == year]
@@ -728,7 +759,9 @@ async def update_dividend_tranche(
     position = await get_owned_active_position(db, portfolio_id, tranche.position_id)
     lots = await get_position_lots(db, position.id)
     position_total_shares, _, _ = position_aggregates(lots)
-    _check_qualifying_shares_bound(new_qualifying_shares, position_total_shares)
+    new_reference_date = new_ex_dividend_date or new_payment_date
+    eligible_shares = shares_eligible_as_of(lots, new_reference_date)
+    _check_qualifying_shares_bound(new_qualifying_shares, eligible_shares, position_total_shares, new_reference_date)
 
     existing_tranches = await get_position_dividend_tranches(db, position.id)
     tranches_for_year = [t for t in existing_tranches if t.year == new_year and t.id != tranche.id]

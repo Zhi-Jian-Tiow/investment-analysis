@@ -26,7 +26,7 @@ async def _percentage_broker(db_session, rate="0.001", minimum_fee="8.00") -> Br
     return broker
 
 
-async def _create_position(client, broker, *, stock_code="1023", shares=5000, purchase_price="8.3800"):
+async def _create_position(client, broker, *, stock_code="1023", shares=5000, purchase_price="8.3800", purchase_date="2026-01-15"):
     resp = await client.post(
         "/api/v1/portfolio/positions",
         json={
@@ -35,7 +35,7 @@ async def _create_position(client, broker, *, stock_code="1023", shares=5000, pu
             "shares": shares,
             "purchase_price": purchase_price,
             "broker_id": str(broker.id),
-            "purchase_date": "2026-01-15",
+            "purchase_date": purchase_date,
         },
     )
     assert resp.status_code == 201
@@ -143,6 +143,110 @@ async def test_add_dividend_allows_qualifying_shares_below_position_total_ec023(
 
 
 @pytest.mark.asyncio
+async def test_add_dividend_exact_copy_when_eligible_equals_current_total(client, seeded_broker, db_session):
+    """BAS US-012's exact mandated string applies when no lot postdates the
+    tranche's reference date — the common case."""
+    await _register(client, seeded_broker)
+    broker = await _percentage_broker(db_session)
+    position = await _create_position(client, broker, shares=5000)
+
+    resp = await client.post(
+        "/api/v1/portfolio/dividends", json=_dividend_body(position["id"], qualifying_shares=5001)
+    )
+
+    assert resp.status_code == 422
+    field = next(f for f in resp.json()["fields"] if f["field"] == "qualifying_shares")
+    assert field["constraint"] == "Qualifying shares cannot exceed the position's current total shares (5,000)"
+
+
+@pytest.mark.asyncio
+async def test_add_dividend_qualifying_shares_bounded_by_shares_owned_as_of_reference_date(
+    client, seeded_broker, db_session
+):
+    """Reported bug: a position with lot 1 (1,000 shares, bought 1 Jul) and
+    lot 2 (3,000 shares, bought 31 Jul) let a dividend dated 15 Jul log up to
+    4,000 qualifying shares — but only lot 1 existed as of 15 Jul, so the max
+    should be 1,000."""
+    await _register(client, seeded_broker)
+    broker = await _percentage_broker(db_session)
+    position = await _create_position(client, broker, shares=1000, purchase_date="2026-07-01")
+    await client.post(
+        f"/api/v1/portfolio/positions/{position['id']}/lots",
+        json={"shares": 3000, "purchase_price": "8.3800", "broker_id": str(broker.id), "purchase_date": "2026-07-31"},
+    )
+
+    too_many = await client.post(
+        "/api/v1/portfolio/dividends",
+        json=_dividend_body(
+            position["id"], qualifying_shares=4000, payment_date="2026-07-15", ex_dividend_date=None
+        ),
+    )
+    assert too_many.status_code == 422
+    field = next(f for f in too_many.json()["fields"] if f["field"] == "qualifying_shares")
+    assert field["constraint"] == (
+        "Qualifying shares cannot exceed the shares held as of 2026-07-15 (1,000) — "
+        "3,000 more shares were purchased after this date"
+    )
+
+    ok = await client.post(
+        "/api/v1/portfolio/dividends",
+        json=_dividend_body(
+            position["id"], qualifying_shares=1000, payment_date="2026-07-15", ex_dividend_date=None
+        ),
+    )
+    assert ok.status_code == 201
+    assert ok.json()["qualifying_shares"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_add_dividend_uses_ex_date_not_payment_date_for_eligibility(client, seeded_broker, db_session):
+    """The reference date is ex_dividend_date when present, not payment_date
+    — a dividend can be logged with a payment date after a later lot as long
+    as the ex-date itself predates that lot."""
+    await _register(client, seeded_broker)
+    broker = await _percentage_broker(db_session)
+    position = await _create_position(client, broker, shares=1000, purchase_date="2026-07-01")
+    await client.post(
+        f"/api/v1/portfolio/positions/{position['id']}/lots",
+        json={"shares": 3000, "purchase_price": "8.3800", "broker_id": str(broker.id), "purchase_date": "2026-07-31"},
+    )
+
+    resp = await client.post(
+        "/api/v1/portfolio/dividends",
+        json=_dividend_body(
+            position["id"], qualifying_shares=1000, payment_date="2026-08-15", ex_dividend_date="2026-07-15"
+        ),
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["qualifying_shares"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_add_dividend_rejects_reference_date_before_any_lot(client, seeded_broker, db_session):
+    """Reported bug: logging a dividend dated earlier than the position's
+    only lot must be rejected — there were zero eligible shares on that
+    date, so even qualifying_shares=1 cannot be satisfied."""
+    await _register(client, seeded_broker)
+    broker = await _percentage_broker(db_session)
+    position = await _create_position(client, broker, shares=1000, purchase_date="2026-07-01")
+
+    resp = await client.post(
+        "/api/v1/portfolio/dividends",
+        json=_dividend_body(
+            position["id"], qualifying_shares=1, payment_date="2026-06-15", ex_dividend_date=None
+        ),
+    )
+
+    assert resp.status_code == 422
+    field = next(f for f in resp.json()["fields"] if f["field"] == "qualifying_shares")
+    assert field["constraint"] == (
+        "Qualifying shares cannot exceed the shares held as of 2026-06-15 (0) — "
+        "1,000 more shares were purchased after this date"
+    )
+
+
+@pytest.mark.asyncio
 async def test_add_dividend_rejects_zero_or_negative_per_share_amount(client, seeded_broker, db_session):
     await _register(client, seeded_broker)
     broker = await _percentage_broker(db_session)
@@ -195,7 +299,9 @@ async def test_add_dividend_rejects_ex_dividend_date_after_payment_date(client, 
 async def test_add_dividend_rejects_ninth_tranche_in_same_year_br014(client, seeded_broker, db_session):
     await _register(client, seeded_broker)
     broker = await _percentage_broker(db_session)
-    position = await _create_position(client, broker)
+    # Lot must predate every one of the early-January payment dates below,
+    # now that qualifying_shares is bounded by shares_eligible_as_of.
+    position = await _create_position(client, broker, purchase_date="2020-01-15")
 
     labels = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th"]
     for i, label in enumerate(labels):
@@ -235,7 +341,8 @@ async def test_add_dividend_rejects_duplicate_tranche_label_same_year(client, se
 async def test_add_dividend_allows_same_label_in_different_years(client, seeded_broker, db_session):
     await _register(client, seeded_broker)
     broker = await _percentage_broker(db_session)
-    position = await _create_position(client, broker)
+    # Lot must predate the 2025 payment date below.
+    position = await _create_position(client, broker, purchase_date="2020-01-15")
 
     y2025 = await client.post(
         "/api/v1/portfolio/dividends",

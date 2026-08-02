@@ -9,11 +9,30 @@ import { useDividendCalendar } from "@/hooks/useDividendCalendar";
 import type { DividendCalendarEntry } from "@/lib/types";
 
 function formatMoney(value: string): string {
-  return "RM " + parseFloat(value).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (
+    "RM " +
+    parseFloat(value).toLocaleString("en-MY", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })
+  );
 }
 
 function formatDate(value: string): string {
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const months = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
   const [y, m, d] = value.split("-").map((part) => parseInt(part, 10));
   return `${d} ${months[m - 1]} ${y}`;
 }
@@ -26,8 +45,17 @@ function CalendarContent() {
   const year = new Date().getFullYear();
   const { tranches, isLoading } = useDividendCalendar(year);
 
-  const dueSoon = tranches.filter((t) => t.is_upcoming);
-  const upcoming = tranches.filter((t) => !t.is_paid && !t.is_upcoming);
+  // Matches the design's own overlapping-sets behavior (`due7`/`calUpcoming`
+  // are independent filters over the same entries, not a partition) — a
+  // due-soon tranche still belongs in the full Upcoming list below it, not
+  // just the highlight cards. Previously this excluded anything already
+  // flagged `is_upcoming`, which meant a tranche with no ex_dividend_date
+  // (is_upcoming falls back to payment_date, per BE-3.3) would only ever
+  // appear in "Due in the next 7 days" and never in "Upcoming".
+  const upcoming = tranches
+    .filter((t) => !t.is_paid)
+    .slice()
+    .sort((a, b) => (a.payment_date < b.payment_date ? -1 : 1));
   const recentlyPaid = tranches
     .filter((t) => t.is_paid)
     .slice()
@@ -40,9 +68,12 @@ function CalendarContent() {
       <AppHeader />
 
       <main className="mx-auto max-w-[1200px] px-6 py-6">
-        <h1 className="m-0 mb-1 text-[22px] font-bold tracking-tight text-foreground">Dividend Calendar</h1>
+        <h1 className="m-0 mb-1 text-[22px] font-bold tracking-tight text-foreground">
+          Dividend Calendar
+        </h1>
         <div className="mb-5 text-[13.5px] text-muted-foreground">
-          Ex-dates and payment dates from your logged dividends. Today is {formatDate(todayIso())}.
+          Ex-dates and payment dates from your logged dividends. Today is{" "}
+          {formatDate(todayIso())}.
         </div>
 
         {isLoading && (
@@ -54,46 +85,20 @@ function CalendarContent() {
         {!isLoading && isEmpty && (
           <div className="rounded-xl border border-border bg-card p-10 text-center">
             <p className="mx-auto max-w-md text-sm text-muted-foreground">
-              Add ex-dates when logging dividends to see your payment schedule here.
+              Add ex-dates when logging dividends to see your payment schedule
+              here.
             </p>
           </div>
         )}
 
         {!isLoading && !isEmpty && (
           <>
-            {dueSoon.length > 0 && (
-              <div className="mb-7">
-                <div className="mb-2.5 text-[13px] font-bold tracking-wide text-[#8A5A00] uppercase">
-                  Due in the next 7 days
-                </div>
-                <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
-                  {dueSoon.map((entry) => (
-                    <Link
-                      key={entry.id}
-                      href={`/positions/${entry.position_id}`}
-                      className="block rounded-xl border border-[#F0D9A6] bg-[#FFFBF0] px-4.5 py-4 hover:no-underline"
-                    >
-                      <div className="flex items-baseline justify-between gap-2">
-                        <div className="text-[15px] font-bold text-foreground">{entry.stock_name}</div>
-                        {entry.ex_dividend_date && (
-                          <span className="shrink-0 rounded-full bg-[#FFF1D0] px-2.5 py-0.5 text-[11px] font-bold text-[#8A5A00]">
-                            Ex {formatDate(entry.ex_dividend_date)}
-                          </span>
-                        )}
-                      </div>
-                      <div className="mt-1.5 text-[12.5px] text-muted-foreground">
-                        {entry.tranche_label} · RM {parseFloat(entry.per_share_amount).toFixed(4)}/share
-                      </div>
-                      <div className="mt-1.5 text-base font-bold text-[#177A4E]">{formatMoney(entry.total_amount)}</div>
-                      <div className="mt-0.5 text-xs text-tertiary">Payment {formatDate(entry.payment_date)}</div>
-                    </Link>
-                  ))}
-                </div>
-              </div>
-            )}
-
             <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-              <CalendarList title="Upcoming" entries={upcoming} emptyText="No other upcoming dividends this year." />
+              <CalendarList
+                title="Upcoming"
+                entries={upcoming}
+                emptyText="No other upcoming dividends this year."
+              />
               <CalendarList
                 title="Recently paid"
                 entries={recentlyPaid}
@@ -121,10 +126,14 @@ function CalendarList({
 }) {
   return (
     <div className="min-w-0">
-      <div className="mb-2.5 text-[13px] font-bold tracking-wide text-muted-foreground uppercase">{title}</div>
+      <div className="mb-2.5 text-[13px] font-bold tracking-wide text-muted-foreground uppercase">
+        {title}
+      </div>
       <div className="rounded-xl border border-border bg-card">
         {entries.length === 0 ? (
-          <div className="px-4 py-5 text-[13px] text-muted-foreground">{emptyText}</div>
+          <div className="px-4 py-5 text-[13px] text-muted-foreground">
+            {emptyText}
+          </div>
         ) : (
           entries.map((entry) => (
             <Link
@@ -134,7 +143,10 @@ function CalendarList({
             >
               <div className="min-w-0">
                 <div className="truncate text-sm font-semibold text-foreground">
-                  {entry.stock_name} <span className="font-normal text-tertiary">{entry.tranche_label}</span>
+                  {entry.stock_name}{" "}
+                  <span className="font-normal text-tertiary">
+                    {entry.tranche_label}
+                  </span>
                 </div>
                 <div className="mt-0.5 text-xs text-muted-foreground">
                   {paid
@@ -144,9 +156,13 @@ function CalendarList({
               </div>
               <div className="flex shrink-0 items-center gap-2.5">
                 <div className="text-right">
-                  <div className="font-bold text-[#177A4E]">{formatMoney(entry.total_amount)}</div>
+                  <div className="font-bold text-[#177A4E]">
+                    {formatMoney(entry.total_amount)}
+                  </div>
                   {!paid && (
-                    <div className="text-[11.5px] text-tertiary">RM {parseFloat(entry.per_share_amount).toFixed(4)}/share</div>
+                    <div className="text-[11.5px] text-tertiary">
+                      RM {parseFloat(entry.per_share_amount).toFixed(4)}/share
+                    </div>
                   )}
                 </div>
                 {paid && (
