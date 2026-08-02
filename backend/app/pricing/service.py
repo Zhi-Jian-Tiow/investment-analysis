@@ -6,6 +6,7 @@ PriceProvider instead of the real network.
 
 import asyncio
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -14,11 +15,17 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.admin.service import get_system_config, release_price_refresh_lock, try_acquire_price_refresh_lock
+from app.admin.service import (
+    get_system_config,
+    record_audit_event,
+    release_price_refresh_lock,
+    try_acquire_price_refresh_lock,
+)
 from app.monitoring import sentry_alert, sentry_checkin
 from app.portfolio.models import Lot, Position
 from app.pricing.models import PriceSnapshot
 from app.pricing.provider import PriceProvider
+from app.pricing.schemas import ManualPriceOverrideRequest
 
 logger = structlog.get_logger()
 
@@ -254,5 +261,72 @@ async def run_price_refresh(
         raise
     finally:
         await release_price_refresh_lock(db)
+
+    return result
+
+
+async def get_latest_prices(db: AsyncSession, stock_codes: list[str]) -> dict[str, PriceSnapshot]:
+    """BE-5.2 / GET /pricing/prices, and reused by the portfolio module to
+    populate current_price/current_market_value/unrealised_pnl on position
+    responses. One query for however many codes are requested — not one
+    query per code — same NFR reasoning as BE-4.1's dashboard batching.
+    """
+    if not stock_codes:
+        return {}
+    result = await db.execute(select(PriceSnapshot).where(PriceSnapshot.stock_code.in_(stock_codes)))
+    latest: dict[str, PriceSnapshot] = {}
+    for snapshot in result.scalars().all():
+        current = latest.get(snapshot.stock_code)
+        if current is None or snapshot.trading_date > current.trading_date:
+            latest[snapshot.stock_code] = snapshot
+    return latest
+
+
+async def create_manual_price_override(
+    db: AsyncSession, user_id: uuid.UUID, data: ManualPriceOverrideRequest
+) -> PriceSnapshot:
+    """BE-5.2. `source='manual'` until BE-5.1's own cron next successfully
+    refreshes this stock_code, at which point run_price_refresh's ordinary
+    UPSERT (source='automated') supersedes it — BR-023 needs no special
+    handling here or there, it falls directly out of both paths writing to
+    the same (stock_code, trading_date) row.
+    """
+    result = await db.execute(
+        select(PriceSnapshot).where(
+            PriceSnapshot.stock_code == data.stock_code, PriceSnapshot.trading_date == data.trading_date
+        )
+    )
+    existing = result.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if existing is not None:
+        existing.price = data.price
+        existing.source = "manual"
+        existing.created_by_user_id = user_id
+        existing.last_refreshed_at = now
+        snapshot = existing
+    else:
+        snapshot = PriceSnapshot(
+            stock_code=data.stock_code,
+            price=data.price,
+            source="manual",
+            trading_date=data.trading_date,
+            created_by_user_id=user_id,
+            last_refreshed_at=now,
+        )
+        db.add(snapshot)
+    await db.flush()
+
+    await record_audit_event(
+        db,
+        user_id=user_id,
+        action="PRICE_OVERRIDE_CREATED",
+        entity_type="PriceSnapshot",
+        entity_id=snapshot.id,
+        metadata={"stock_code": data.stock_code, "price": str(data.price), "trading_date": data.trading_date.isoformat()},
+    )
+
+    await db.commit()
+    await db.refresh(snapshot)
+    return snapshot
 
     return result

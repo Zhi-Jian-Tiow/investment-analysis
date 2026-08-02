@@ -92,6 +92,16 @@ def version_conflict() -> AppError:
     )
 
 
+def trial_expired_paywall(message: str) -> AppError:
+    """422 trial_expired — BAS EC-020 / Permission Matrix §9: a write action
+    attempted by a trial_expired (read-only) account. Not 403: this is a
+    business-rule/paywall condition, not an ownership check (the OpenAPI
+    spec is explicit about this distinction for BE-5.2's manual-override
+    endpoint). Error code matches the `account_status` value itself.
+    """
+    return AppError(422, "trial_expired", message)
+
+
 def last_lot_cannot_be_deleted() -> AppError:
     """409 last_lot — deleting a position's only remaining active Lot would
     leave a lot-less, zero-share Position dangling. Not part of any

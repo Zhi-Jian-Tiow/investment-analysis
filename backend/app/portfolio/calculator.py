@@ -97,6 +97,20 @@ def calculate_lot_fees(shares: int, purchase_price: Decimal, broker: BrokerConfi
     )
 
 
+def compute_market_value_and_pnl(
+    total_shares: int, current_price: Decimal | None, total_all_in_cost: Decimal
+) -> tuple[Decimal | None, Decimal | None]:
+    """BR-025: current_market_value = total_shares x current_price;
+    unrealised_pnl = current_market_value - total_all_in_cost. Both null
+    when there's no price data at all (EC-005) — never a false RM0.00.
+    """
+    if current_price is None:
+        return None, None
+    market_value = round_myr(Decimal(total_shares) * current_price)
+    pnl = round_myr(market_value - total_all_in_cost)
+    return market_value, pnl
+
+
 @dataclass(frozen=True)
 class SellScenarioRow:
     price: Decimal

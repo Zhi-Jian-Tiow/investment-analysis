@@ -11,7 +11,9 @@ from app.database import get_db
 from app.errors import validation_error
 from app.rate_limit import limiter
 
+from app.portfolio.calculator import compute_market_value_and_pnl
 from app.portfolio.models import DividendTranche, Lot, Position
+from app.pricing.models import PriceSnapshot
 from app.portfolio.schemas import (
     BrokerConfigResponse,
     BrokerListResponse,
@@ -52,6 +54,7 @@ from app.portfolio.service import (
     update_lot,
     update_position_metadata,
 )
+from app.pricing.service import get_latest_prices
 
 # Dashboard/Sell-Calculator routes belong to Epic 4. Position/Lot creation is
 # added in BE-2.1/BE-2.2; edit in BE-2.3; delete in BE-2.4; dividend logging
@@ -64,9 +67,18 @@ def _build_position_response(
     lots: list[Lot],
     tranches: list[DividendTranche] | None = None,
     warnings: list[str] | None = None,
+    price_snapshot: PriceSnapshot | None = None,
 ) -> PositionResponse:
+    """BE-5.2: `price_snapshot` is the position's stock_code's latest
+    PriceSnapshot, if any (Epic 5 — always None before BE-5.1 existed).
+    `current_market_value`/`unrealised_pnl` are derived from it here, not
+    stored anywhere (architecture ADR-004 — computed at read time, same as
+    every other position aggregate).
+    """
     total_shares, total_all_in_cost, blended_purchase_price = position_aggregates(lots)
     tranches = tranches or []
+    current_price = price_snapshot.price if price_snapshot else None
+    current_market_value, unrealised_pnl = compute_market_value_and_pnl(total_shares, current_price, total_all_in_cost)
     return PositionResponse(
         id=position.id,
         stock_code=position.stock_code,
@@ -77,6 +89,11 @@ def _build_position_response(
         total_all_in_cost=total_all_in_cost,
         blended_purchase_price=blended_purchase_price,
         total_dividend_income_ytd=position_dividend_income_ytd(tranches),
+        current_price=current_price,
+        price_source=price_snapshot.source if price_snapshot else None,
+        price_last_refreshed_at=price_snapshot.last_refreshed_at if price_snapshot else None,
+        current_market_value=current_market_value,
+        unrealised_pnl=unrealised_pnl,
         lots=[LotResponse.model_validate(lot) for lot in lots],
         dividend_tranches=[DividendTrancheResponse.model_validate(t) for t in tranches],
         is_deleted=position.is_deleted,
@@ -115,25 +132,37 @@ async def get_dashboard(
     other per-position fields match BAS §7's derived-aggregates table.
 
     current_price/price_source/price_last_refreshed_at/current_market_value/
-    unrealised_pnl and the portfolio-level last_price_refresh_at stay at
-    their documented-nullable defaults (BAS EC-005) until the price-feed
-    epic (Epic 5) exists.
+    unrealised_pnl (BE-5.2) are real as of Epic 5 — null only for a stock
+    that has never had any PriceSnapshot at all (EC-005), not merely because
+    the epic didn't exist yet.
 
     Uses list_positions_for_dashboard's batched read (3 queries total) rather
     than querying lots/tranches once per position — see that function's
-    docstring for the NFR reasoning.
+    docstring for the NFR reasoning. Prices are batched the same way
+    (get_latest_prices, one query for every stock_code on the page).
     """
     portfolio = await get_portfolio_for_user(db, current_user.id)
     rows = await list_positions_for_dashboard(db, portfolio.id)
+    prices = await get_latest_prices(db, [position.stock_code for position, _, _ in rows])
 
     summaries: list[PositionSummaryResponse] = []
     total_all_in_cost = Decimal("0.00")
     total_dividend_income_ytd = Decimal("0.00")
+    last_price_refresh_at = None
     for position, lots, tranches in rows:
         total_shares, position_all_in_cost, blended_purchase_price = position_aggregates(lots)
         position_income_ytd = position_dividend_income_ytd(tranches)
         total_all_in_cost += position_all_in_cost
         total_dividend_income_ytd += position_income_ytd
+
+        price_snapshot = prices.get(position.stock_code)
+        current_price = price_snapshot.price if price_snapshot else None
+        current_market_value, unrealised_pnl = compute_market_value_and_pnl(
+            total_shares, current_price, position_all_in_cost
+        )
+        if price_snapshot and (last_price_refresh_at is None or price_snapshot.last_refreshed_at > last_price_refresh_at):
+            last_price_refresh_at = price_snapshot.last_refreshed_at
+
         summaries.append(
             PositionSummaryResponse(
                 id=position.id,
@@ -144,14 +173,30 @@ async def get_dashboard(
                 total_all_in_cost=position_all_in_cost,
                 blended_purchase_price=blended_purchase_price,
                 total_dividend_income_ytd=position_income_ytd,
+                current_price=current_price,
+                price_source=price_snapshot.source if price_snapshot else None,
+                price_last_refreshed_at=price_snapshot.last_refreshed_at if price_snapshot else None,
+                current_market_value=current_market_value,
+                unrealised_pnl=unrealised_pnl,
             )
         )
 
     return PortfolioResponse(
         total_all_in_cost=total_all_in_cost,
         total_dividend_income_ytd=total_dividend_income_ytd,
+        last_price_refresh_at=last_price_refresh_at,
         positions=summaries,
     )
+
+
+async def _latest_price_for(db: AsyncSession, stock_code: str) -> PriceSnapshot | None:
+    """Single-position convenience wrapper around get_latest_prices' bulk
+    lookup. PriceSnapshot is shared system data (BE-5.2's own Technical
+    Constraints) — even a just-created position can already have one, if
+    another user holds the same stock_code.
+    """
+    prices = await get_latest_prices(db, [stock_code])
+    return prices.get(stock_code)
 
 
 @router.post(
@@ -171,8 +216,9 @@ async def add_position(
         db, current_user.id, portfolio.id, body
     )
     tranches = await get_position_dividend_tranches(db, position.id)
+    price_snapshot = await _latest_price_for(db, position.stock_code)
 
-    return _build_position_response(position, lots, tranches, warnings)
+    return _build_position_response(position, lots, tranches, warnings, price_snapshot)
 
 
 @router.post(
@@ -228,8 +274,9 @@ async def get_position(
     position = await get_owned_active_position(db, portfolio.id, position_id)
     lots = await get_position_lots(db, position.id)
     tranches = await get_position_dividend_tranches(db, position.id)
+    price_snapshot = await _latest_price_for(db, position.stock_code)
 
-    return _build_position_response(position, lots, tranches)
+    return _build_position_response(position, lots, tranches, price_snapshot=price_snapshot)
 
 
 def _check_scenario_price(raw: str) -> Decimal:
@@ -321,8 +368,9 @@ async def patch_position(
     )
     lots = await get_position_lots(db, position.id)
     tranches = await get_position_dividend_tranches(db, position.id)
+    price_snapshot = await _latest_price_for(db, position.stock_code)
 
-    return _build_position_response(position, lots, tranches)
+    return _build_position_response(position, lots, tranches, price_snapshot=price_snapshot)
 
 
 @router.patch(

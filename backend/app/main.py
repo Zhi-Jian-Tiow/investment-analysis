@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.errors import AppError
 from app.portfolio.router import router as portfolio_router
+from app.pricing.router import router as pricing_router
 from app.rate_limit import limiter
 
 
@@ -73,6 +74,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router)
     app.include_router(portfolio_router)
+    app.include_router(pricing_router)
 
     @app.get("/health")
     async def health_check(db: AsyncSession = Depends(get_db)):
