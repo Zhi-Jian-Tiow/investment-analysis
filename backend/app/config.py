@@ -1,8 +1,20 @@
 from functools import lru_cache
+from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Render's "Secret Files" feature (as opposed to a plain environment
+# variable) mounts the file's content on disk rather than injecting it into
+# the process environment — pydantic-settings only ever reads real env vars,
+# so a value stored this way is invisible to Settings() and silently
+# resolves to the field's default ("") unless read from disk explicitly.
+# Render documents this exact path convention: /etc/secrets/<key-name>,
+# where <key-name> is whatever name was given when the Secret File was
+# created (JWT_PRIVATE_KEY / JWT_PUBLIC_KEY here, matching the env-var name
+# these would otherwise have used).
+_RENDER_SECRET_FILES_DIR = Path("/etc/secrets")
 
 # PEM header/footer candidates tried, in order, when a jwt_private_key /
 # jwt_public_key value can't be loaded as-is — either because it has no
@@ -141,25 +153,24 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
 
 
-def _log_pem_diagnostic(name: str, value: str) -> None:
-    # TEMPORARY — debugging a production PEM-parsing failure that the
-    # flattened-newline repair didn't fix. Logs shape only, never content:
-    # no slice of `value` is ever printed, so this is safe to leave in
-    # Render's logs. Remove once the real cause is confirmed and fixed.
-    print(
-        f"[pem-diagnostic] {name}: len={len(value)} "
-        f"newline_count={value.count(chr(10))} "
-        f"contains_BEGIN={'BEGIN' in value} "
-        f"contains_END={'END' in value} "
-        f"contains_literal_backslash_n={chr(92) + 'n' in value} "
-        f"leading_ws={repr(value[:1]) if value else None} "
-        f"trailing_ws={repr(value[-1:]) if value else None}"
-    )
+def _read_render_secret_file(key_name: str) -> str | None:
+    path = _RENDER_SECRET_FILES_DIR / key_name
+    if path.is_file():
+        return path.read_text()
+    return None  # not present — e.g. local dev, or this key uses a plain env var instead
 
 
 @lru_cache
 def get_settings() -> Settings:
-    settings = Settings()
-    _log_pem_diagnostic("jwt_private_key", settings.jwt_private_key)
-    _log_pem_diagnostic("jwt_public_key", settings.jwt_public_key)
-    return settings
+    # Explicit constructor kwargs take priority over env-var-sourced values
+    # in pydantic-settings, so this only overrides jwt_private_key/
+    # jwt_public_key when a matching Secret File actually exists — every
+    # other field (and these two, on a machine using plain env vars instead)
+    # still resolves normally from the environment/.env file.
+    secret_file_overrides = {}
+    for env_name, field_name in [("JWT_PRIVATE_KEY", "jwt_private_key"), ("JWT_PUBLIC_KEY", "jwt_public_key")]:
+        content = _read_render_secret_file(env_name)
+        if content is not None:
+            secret_file_overrides[field_name] = content
+
+    return Settings(**secret_file_overrides)

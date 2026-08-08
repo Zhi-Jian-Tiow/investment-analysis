@@ -1,7 +1,8 @@
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from app.config import Settings
+import app.config as config_module
+from app.config import Settings, get_settings
 
 
 def _generate_rsa_pem_pair() -> tuple[str, str]:
@@ -97,3 +98,46 @@ def test_unrepairable_garbage_is_passed_through_untouched():
     settings = Settings(jwt_private_key="not a key at all", jwt_public_key="also not a key")
     assert settings.jwt_private_key == "not a key at all"
     assert settings.jwt_public_key == "also not a key"
+
+
+def test_get_settings_reads_render_secret_files_when_present(tmp_path, monkeypatch):
+    """The real bug: Render's "Secret Files" feature mounts content on disk
+    rather than injecting an env var — pydantic-settings only reads env
+    vars, so a JWT key stored this way was invisible to Settings() and
+    silently resolved to "" (confirmed live via a diagnostic log showing
+    len=0). get_settings() must check the documented /etc/secrets/<name>
+    location and use that content when a plain env var isn't set."""
+    private_pem, public_pem = _generate_rsa_pem_pair()
+    (tmp_path / "JWT_PRIVATE_KEY").write_text(private_pem)
+    (tmp_path / "JWT_PUBLIC_KEY").write_text(public_pem)
+
+    monkeypatch.setattr(config_module, "_RENDER_SECRET_FILES_DIR", tmp_path)
+    monkeypatch.setenv("JWT_PRIVATE_KEY", "")
+    monkeypatch.setenv("JWT_PUBLIC_KEY", "")
+    get_settings.cache_clear()
+
+    settings = get_settings()
+    try:
+        serialization.load_pem_private_key(settings.jwt_private_key.encode(), password=None)
+        serialization.load_pem_public_key(settings.jwt_public_key.encode())
+    finally:
+        get_settings.cache_clear()  # don't leak this override into other tests
+
+
+def test_get_settings_falls_back_to_env_var_when_no_secret_file_present(tmp_path, monkeypatch):
+    """Local dev (and anyone using plain env vars instead of Secret Files on
+    Render) must be unaffected — no file at the mount point means the
+    env-var-sourced value is used exactly as before."""
+    private_pem, public_pem = _generate_rsa_pem_pair()
+
+    monkeypatch.setattr(config_module, "_RENDER_SECRET_FILES_DIR", tmp_path)  # empty dir — no secret files
+    monkeypatch.setenv("JWT_PRIVATE_KEY", private_pem)
+    monkeypatch.setenv("JWT_PUBLIC_KEY", public_pem)
+    get_settings.cache_clear()
+
+    settings = get_settings()
+    try:
+        assert settings.jwt_private_key == private_pem.strip()
+        assert settings.jwt_public_key == public_pem.strip()
+    finally:
+        get_settings.cache_clear()
