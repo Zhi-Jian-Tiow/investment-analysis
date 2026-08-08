@@ -54,6 +54,23 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = "postgresql+asyncpg://bursatrack:bursatrack@localhost:5433/bursatrack"
 
+    @field_validator("database_url")
+    @classmethod
+    def _normalize_asyncpg_driver(cls, v: str) -> str:
+        # Managed Postgres providers (Render, Heroku, Supabase, ...) hand out
+        # a bare "postgres://" or "postgresql://" connection string in their
+        # dashboard. Without an explicit "+asyncpg" driver suffix, SQLAlchemy
+        # defaults the postgresql dialect to the sync psycopg2 driver — which
+        # this app never installs, since every DB call here is async via
+        # asyncpg. Rewrite rather than require the pasted value to already be
+        # SQLAlchemy-specific; already-correct URLs (any explicit "+driver")
+        # pass through untouched.
+        if v.startswith("postgres://"):
+            return "postgresql+asyncpg://" + v[len("postgres://") :]
+        if v.startswith("postgresql://"):
+            return "postgresql+asyncpg://" + v[len("postgresql://") :]
+        return v
+
     # RS256 keypair, PEM-encoded (architecture §14.1). Stored as raw PEM content in
     # the env var, matching how Render environment variables are documented to hold it.
     jwt_private_key: str = ""
