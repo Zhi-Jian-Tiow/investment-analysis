@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Render's "Secret Files" feature (as opposed to a plain environment
@@ -123,6 +123,28 @@ class Settings(BaseSettings):
     session_cookie_name: str = "bursatrack_session"
     cookie_secure: bool = True
 
+    # ADR-014 chose SameSite=Lax, assuming frontend/backend would share a
+    # registrable domain in production (e.g. app.bursatrack.com +
+    # api.bursatrack.com are "same-site" despite being subdomains). The
+    # current deployment topology — Vercel's *.vercel.app and Render's
+    # *.onrender.com — is genuinely cross-site, and Lax cookies are withheld
+    # by the browser on cross-site fetch()/XHR (only sent on top-level
+    # navigation), which is why every login appeared to immediately log back
+    # out: the Set-Cookie succeeded, but the browser never sent it back.
+    # Configurable rather than hardcoded to "none" so local dev — localhost
+    # differing only by port is still same-site — keeps working under Lax
+    # unchanged. Move back to "lax" once frontend/backend share a real
+    # parent domain (custom domain, medium-term per architecture §18.3).
+    cookie_samesite: str = "lax"
+
+    @field_validator("cookie_samesite")
+    @classmethod
+    def _validate_samesite(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in ("lax", "strict", "none"):
+            raise ValueError(f"cookie_samesite must be one of lax/strict/none, got {v!r}")
+        return normalized
+
     admin_api_key: str = ""
 
     # Resend (architecture §11.3). email_from_address defaults to Resend's own
@@ -151,6 +173,16 @@ class Settings(BaseSettings):
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
+
+    @model_validator(mode="after")
+    def _samesite_none_requires_secure(self) -> "Settings":
+        # Browsers silently drop a Set-Cookie with SameSite=None unless
+        # Secure is also set — failing loudly here beats shipping a config
+        # that looks fine but produces the exact "login immediately logs
+        # back out" symptom this setting exists to fix.
+        if self.cookie_samesite == "none" and not self.cookie_secure:
+            raise ValueError("cookie_samesite='none' requires cookie_secure=true (browsers reject the combination)")
+        return self
 
 
 def _read_render_secret_file(key_name: str) -> str | None:

@@ -44,7 +44,7 @@ def _set_session_cookie(response: Response, settings: Settings, access_token: st
         value=access_token,
         httponly=True,
         secure=settings.cookie_secure,
-        samesite="lax",
+        samesite=settings.cookie_samesite,
         max_age=settings.jwt_access_token_expiry_days * 86400,
     )
 
@@ -141,7 +141,15 @@ async def logout(
     current_user: User = Depends(get_current_user),
 ) -> None:
     await logout_user(db, current_user)
-    response.delete_cookie(key=settings.session_cookie_name)
+    # secure/samesite must match the original set_cookie() attributes —
+    # delete_cookie() defaults to secure=False/samesite="lax" independently
+    # otherwise, which isn't guaranteed to reliably clear a cookie that was
+    # actually set with different attributes (e.g. samesite="none" here).
+    response.delete_cookie(
+        key=settings.session_cookie_name,
+        secure=settings.cookie_secure,
+        samesite=settings.cookie_samesite,
+    )
 
 
 @router.post("/refresh", response_model=AuthResponse)
