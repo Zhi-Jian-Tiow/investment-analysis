@@ -8,12 +8,35 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.router import router as auth_router
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.database import get_db
 from app.errors import AppError
 from app.portfolio.router import router as portfolio_router
 from app.pricing.router import router as pricing_router
 from app.rate_limit import limiter
+
+
+def add_cors_middleware(app: FastAPI, settings: Settings) -> None:
+    """Split out from create_app() so the exact CORS wiring used by the real
+    app can also be exercised directly in tests (app.state.limiter is a
+    startup-time singleton, so the real `app` object's middleware can't be
+    reconfigured per-test the way Depends(get_settings) can).
+    """
+    # allow_credentials=True is required for the HTTP-only session cookie to
+    # be sent cross-origin (frontend on :3000, backend on :8000 in dev) — see
+    # architecture §14.3. That flag makes a wildcard allow_origins invalid
+    # per the CORS spec, so this must be a concrete origin list.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_allowed_origins_list,
+        # CORSMiddleware itself does the regex-or-static-list matching
+        # (architecture §14.3) — None (not "") when unset, since Starlette
+        # treats an empty string as "match everything", not "disabled".
+        allow_origin_regex=settings.cors_vercel_preview_regex or None,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+        allow_headers=["Content-Type"],
+    )
 
 
 def create_app() -> FastAPI:
@@ -22,18 +45,7 @@ def create_app() -> FastAPI:
     app.state.limiter = limiter
     app.add_middleware(SlowAPIMiddleware)
 
-    # allow_credentials=True is required for the HTTP-only session cookie to
-    # be sent cross-origin (frontend on :3000, backend on :8000 in dev) — see
-    # architecture §14.3. That flag makes a wildcard allow_origins invalid
-    # per the CORS spec, so this must be a concrete origin list.
-    settings = get_settings()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_allowed_origins_list,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
-        allow_headers=["Content-Type"],
-    )
+    add_cors_middleware(app, get_settings())
 
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
