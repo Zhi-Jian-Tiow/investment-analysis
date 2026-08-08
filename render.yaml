@@ -16,6 +16,16 @@
 # Postgres's 90-day auto-expiry are both knowingly deferred, not forgotten.
 # Switch both to a paid plan (web: starter; db: basic-256mb) before this
 # becomes anything other than a throwaway environment.
+#
+# NOTE: envVars are duplicated between the two services below rather than
+# shared via a top-level envVarGroups reference — an earlier draft tried
+# `services[].envVarGroups`, which Render's Blueprint parser rejected
+# outright ("field envVarGroups not found in type file.Service"). Render's
+# env-var-group *sharing* mechanism is a Projects/Environments-level
+# concept, not something a Service block can reference directly in this
+# classic Blueprint format — verified by the real parser error, not by
+# further doc-guessing. Keep both services' envVars lists in sync by hand
+# if either changes.
 
 databases:
   - name: bursatrack-db
@@ -23,8 +33,18 @@ databases:
     region: singapore
     postgresMajorVersion: "16"
 
-envVarGroups:
-  - name: bursatrack-shared
+services:
+  - name: bursatrack-api
+    type: web
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free # testing only — R-008's cold-start mitigation is deferred; switch to starter before real use
+    region: singapore
+    healthCheckPath: /health
+    # Migration gate (architecture §18.2): if this fails, the deploy aborts
+    # and the previous version keeps running — never a partial/broken deploy.
+    preDeployCommand: uv run alembic upgrade head
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -63,20 +83,6 @@ envVarGroups:
       - key: CORS_VERCEL_PREVIEW_REGEX
         sync: false # depends on the actual Vercel project slug — see app/config.py
 
-services:
-  - name: bursatrack-api
-    type: web
-    runtime: docker
-    dockerfilePath: backend/Dockerfile
-    dockerContext: backend
-    plan: free # testing only — R-008's cold-start mitigation is deferred; switch to starter before real use
-    region: singapore
-    healthCheckPath: /health
-    # Migration gate (architecture §18.2): if this fails, the deploy aborts
-    # and the previous version keeps running — never a partial/broken deploy.
-    preDeployCommand: uv run alembic upgrade head
-    envVarGroups:
-      - bursatrack-shared
 
   # - name: bursatrack-refresh-prices
   #   type: cron
@@ -88,5 +94,36 @@ services:
   #   # 09:30 UTC = 5:30 PM MYT, Mon-Fri (architecture §8.4 / BE-5.1)
   #   schedule: "30 9 * * 1-5"
   #   startCommand: uv run python scripts/refresh_prices.py
-  #   envVarGroups:
-  #     - bursatrack-shared
+  #   envVars:
+  #     - key: DATABASE_URL
+  #       fromDatabase:
+  #         name: bursatrack-db
+  #         property: connectionString
+  #     - key: ENVIRONMENT
+  #       value: staging
+  #     - key: JWT_ACCESS_TOKEN_EXPIRY_DAYS
+  #       value: "7"
+  #     - key: TRIAL_PERIOD_DAYS
+  #       value: "14"
+  #     - key: EMAIL_VERIFICATION_TOKEN_EXPIRY_HOURS
+  #       value: "24"
+  #     - key: SESSION_COOKIE_NAME
+  #       value: bursatrack_session
+  #     - key: COOKIE_SECURE
+  #       value: "true"
+  #     - key: JWT_PRIVATE_KEY
+  #       sync: false
+  #     - key: JWT_PUBLIC_KEY
+  #       sync: false
+  #     - key: ADMIN_API_KEY
+  #       sync: false
+  #     - key: RESEND_API_KEY
+  #       sync: false
+  #     - key: EMAIL_FROM_ADDRESS
+  #       sync: false
+  #     - key: FRONTEND_BASE_URL
+  #       sync: false
+  #     - key: CORS_ALLOWED_ORIGINS
+  #       sync: false
+  #     - key: CORS_VERCEL_PREVIEW_REGEX
+  #       sync: false
