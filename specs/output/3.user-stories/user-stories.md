@@ -2480,15 +2480,15 @@ Then docker-compose brings up FastAPI, Next.js, and PostgreSQL locally, matching
 
 **Acceptance Criteria**
 
-- [ ] Backend scaffold matches the exact module layout: `app/{auth,portfolio,pricing,subscription,admin}/{models,schemas,router,service}.py`, plus `app/scripts/` for cron jobs
-- [ ] Frontend scaffold matches the Next.js App Router layout: `(auth)` and `(app)` route groups, `components/{ui,portfolio,dividends,calculator,subscription,shared}`, `hooks/`, `lib/`
-- [ ] `docker-compose.yml` runs FastAPI + Next.js + PostgreSQL with hot-reload for local development
-- [ ] `.env.example` documents every required environment variable from architecture §14.5 without committing real secrets
-- [ ] No cross-module direct database joins — all cross-domain access goes through service-layer interfaces (P-008), enforced by code review / import-linting from day one
+- [~] Backend scaffold matches the exact module layout: `app/{auth,portfolio,pricing,subscription,admin}/{models,schemas,router,service}.py`, plus `app/scripts/` for cron jobs — see Implementation Record Deviation 1
+- [~] Frontend scaffold matches the Next.js App Router layout: `(auth)` and `(app)` route groups, `components/{ui,portfolio,dividends,calculator,subscription,shared}`, `hooks/`, `lib/` — see Implementation Record Deviation 2
+- [x] `docker-compose.yml` runs FastAPI + Next.js + PostgreSQL with hot-reload for local development
+- [x] `.env.example` documents every required environment variable from architecture §14.5 without committing real secrets
+- [~] No cross-module direct database joins — all cross-domain access goes through service-layer interfaces (P-008); enforced by code review only, not import-linting — see Implementation Record Deviation 3
 
 **Definition of Done**
 
-- [ ] A fresh clone + `docker-compose up` reaches a working "hello world" health check on both frontend and backend with zero manual steps beyond copying `.env.example`
+- [x] A fresh clone + `docker-compose up` reaches a working "hello world" health check on both frontend and backend with zero manual steps beyond copying `.env.example`
 
 **Dependencies & Integrations**
 
@@ -2497,6 +2497,39 @@ Then docker-compose brings up FastAPI, Next.js, and PostgreSQL locally, matching
 **Technical Constraints**
 
 - Python 3.13, FastAPI, async SQLAlchemy, Pydantic v2; Next.js 15, TypeScript strict mode, Tailwind, shadcn/ui (architecture §1 "at a glance" table)
+
+---
+
+### Implementation Record — DEP-9.1
+
+**What was actually built**
+
+- `docker-compose.yml` (new, repo root) — three services (`postgres`, `backend`, `frontend`), hot-reload on both apps via bind-mounted source + named volumes for `.venv`/`node_modules`/`.next` (so the bind mount doesn't shadow what got installed at image-build time), `depends_on: condition: service_healthy` gating backend startup on Postgres, and a container-level healthcheck on the backend hitting its own `/health`.
+- `backend/Dockerfile.dev`, `backend/.dockerignore` — `python:3.13-slim` + `uv sync --frozen`, `uv run uvicorn --reload` as the CMD. The `uv` binary itself is copied from `ghcr.io/astral-sh/uv:0.11.29` (pinned to the exact version this machine's local dev tooling uses, per uv's own Docker guide's "pin to a specific uv version" guidance) — not `pip install uv`, which was the first pass and got corrected after review (post-implementation correction, not part of the original build).
+- `frontend/Dockerfile.dev`, `frontend/.dockerignore` — `node:22-alpine` + `npm ci`, `npm run dev -- -H 0.0.0.0` as the CMD (the `-H` flag is required — without it the dev server binds to a loopback-only address inside the container and is unreachable from the host).
+- `backend/.env.example` — added the previously-undocumented `CORS_ALLOWED_ORIGINS` (already consumed by `app/config.py` since it was added, just never added to the example file), plus commented-out placeholders for `SENTRY_DSN`/`STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` per architecture §14.5, explicitly marked as not yet consumed by any code (Sentry: DEP-9.5; Stripe: Epic 7).
+- Removed `backend/docker-compose.yml` (Postgres-only, pre-dated this story) — superseded by the root file to avoid two compose projects fighting over the same container name.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **The backend module layout only partially matches architecture §7.2's illustrative tree.** `auth/`, `portfolio/`, `pricing/`, `admin/` exist as designed. `subscription/` doesn't exist yet — Epic 7 (Stripe billing) hasn't been built. `admin/` has `models.py`/`service.py` but no `router.py`/`schemas.py` of its own — `/health` lives directly in `main.py` and CORS/config live in `config.py`, which is where they landed organically across Epics 1–5 rather than being routed through a dedicated admin router. `app/scripts/` has only `refresh_prices.py`; `check_trial_expiry.py` and `process_deletions.py` don't exist yet (their owning epics — 7 and 8 — aren't built), and `process_renewals.py` was deliberately never built at all (DEP-9.3's own AC note: renewal is Stripe-native, that cron was removed from the plan). This is the direct, expected consequence of doing DEP-9.1 last instead of first, as originally sequenced — the module tree reflects five epics of real, organically-evolved implementation, not the pre-implementation illustrative sketch. No retroactive refactor was done to force a match; that would be pure churn against already-shipped, tested code for no behavioral benefit.
+2. **The frontend structure has diverged further from architecture §7.2's sketch than the backend has.** No `(auth)`/`(app)` Next.js route groups exist — routes sit flat under `app/` (`dashboard/`, `positions/`, `calendar/`, `login/`, etc.). `components/` has `ui/`, `portfolio/`, `shared/`, `dashboard/`, `layout/`, but not the spec's `dividends/`, `calculator/`, `subscription/` split (dividend and sell-calculator UI live inside `portfolio/` and the position detail page instead). `lib/` has `api.ts`, `constants.ts`, `dividend-calculator.ts`, `dividend-validation.ts`, `fee-calculator.ts`, `category-tags.ts`, `auth-context.tsx` — different names/boundaries than the spec's illustrative `fees.ts`/`decimal.ts`/`dates.ts`. Same reasoning as Deviation 1: this reflects real decisions made story-by-story (documented in each story's own Implementation Record) rather than the pre-build sketch, and wasn't retroactively forced to match here.
+3. **No automated import-linter was ever added.** The "no cross-module direct database joins" rule was followed by discipline during code review across every prior story (e.g. BE-5.1's price-refresh query goes through `Position`, not a direct join into another module's internals) but no tool (e.g. `import-linter`) enforces it mechanically. Flagged as a real gap rather than silently checked off.
+
+**Test evidence**
+
+- `docker compose config` — valid.
+- `docker compose build backend` and `docker compose build frontend` — both build clean from a cold cache.
+- **Live end-to-end run**: `docker compose up -d` brought up all three containers; `bursatrack-postgres` reported `healthy`, `bursatrack-backend` reported `healthy` (its own `/health` check), `bursatrack-frontend` came up and served `GET /` and `GET /dashboard` with `200`. `curl http://localhost:8000/health` → `{"status":"ok","db":"ok"}`. `curl http://localhost:3000` → `200`.
+- **Hot-reload verified for real, not assumed**: edited `app/main.py`'s `/health` handler while the stack was running, confirmed via `curl` that the change was live inside the container within seconds (WatchFiles-triggered reload, no rebuild), then reverted. Frontend bind-mount confirmed by editing `dashboard/page.tsx` and observing Next's dev server recompile the route in the container logs, then reverted (`git checkout --`).
+- **This machine's existing local dev data was preserved, not reset**: the pre-existing `backend/docker-compose.yml` had implicitly named its Postgres volume `backend_bursatrack_pg_data` (Compose prefixes volume names by the compose file's directory). The new root-level file would default to a differently-prefixed volume name (`investment-analysis_bursatrack_pg_data`) and start against an empty database — copied the data across with a one-off `docker run` (alpine + `cp -a`) before bringing the stack up, rather than either hardcoding a machine-specific `external: true` volume reference into the committed file (which would break a genuine fresh clone) or silently losing the existing data. Verified post-copy: `SELECT count(*) FROM users` returned 20 rows including the real account, and `alembic_version` read `0013`, matching pre-migration state exactly.
+
+**Known gaps / not yet verified**
+
+- Structural deviations 1 and 2 above are real and unresolved — no plan to reconcile the shipped module layout with architecture §7.2's illustrative tree; the spec document itself is now the outdated artifact, not the code.
+- No import-linting tool enforces module-boundary discipline (Deviation 3) — relies entirely on code review.
+- The DoD's "fresh clone" claim was verified structurally (`docker compose build` + `config`) and functionally (a live `up` reaching both health checks) but not from an actual second, disk-clean clone of the repo — this machine already had `backend/.env`/`frontend/.env.local` populated from earlier stories, so the "copy `.env.example`" step itself wasn't exercised end-to-end.
+- `npm ci` during the frontend image build reports 7 pre-existing vulnerabilities (2 moderate, 5 high) in the current `package-lock.json` — pre-existing, not introduced by this story, not triaged here.
 
 ---
 

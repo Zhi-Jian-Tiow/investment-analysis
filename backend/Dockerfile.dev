@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+FROM python:3.13-slim
+
+# Per uv's Docker guide (docs.astral.sh/uv/guides/integration/docker), the
+# uv binary is copied from Astral's own distroless image rather than
+# installed via pip — and pinned to the exact uv version used for local dev
+# (`uv --version` on this machine), not `:latest`.
+COPY --from=ghcr.io/astral-sh/uv:0.11.29 /uv /uvx /bin/
+
+WORKDIR /app
+
+# Dependency layer cached separately from the app source so code edits don't
+# invalidate it (docker-compose bind-mounts the source over this anyway —
+# this COPY only matters for the image build itself). uv.lock/pyproject.toml
+# are bind-mounted (not COPYed) for this step so they don't need a separate
+# COPY instruction just to warm the dependency cache.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-install-project
+
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen
+
+EXPOSE 8000
+
+CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
