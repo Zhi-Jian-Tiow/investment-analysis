@@ -90,11 +90,18 @@ class Settings(BaseSettings):
     # guess, so it's a one-line config change once the frontend is deployed.
     frontend_base_url: str = "http://localhost:3000"
 
-    # CORS (architecture §14.3). Comma-separated static allowlist. The
-    # architecture's fuller design (production domain + a regex for Vercel
-    # preview URLs) is deferred until there's an actual deployment target —
-    # this is just enough for local dev against the FE-1.x Next.js app.
+    # CORS (architecture §14.3). Comma-separated static allowlist — production
+    # domain(s) plus http://localhost:3000 for local dev.
     cors_allowed_origins: str = "http://localhost:3000"
+
+    # CRIT-R-001: a bare "https://*.vercel.app" wildcard is unsafe combined
+    # with allow_credentials=True (any Vercel-hosted app could then make
+    # credentialed cross-origin requests). This must instead be a regex
+    # scoped to this project's own preview URLs specifically — e.g.
+    # r"^https://bursatrack-[a-z0-9-]+-[a-z0-9]+\.vercel\.app$" once the real
+    # Vercel project slug is known. Left empty (disabled) until then — DEP-9.3
+    # sets this once the Vercel project actually exists, not before.
+    cors_vercel_preview_regex: str = ""
 
     @property
     def cors_allowed_origins_list(self) -> list[str]:

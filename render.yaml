@@ -1,0 +1,92 @@
+# Render Blueprint (DEP-9.3). Provisions the backend web service, the
+# refresh_prices cron job, and managed Postgres, all from this one file —
+# see specs/output/2.technical-designs/solution-architect (ADR-010, §18) for
+# the underlying decision record.
+#
+# check_trial_expiry / process_deletions cron jobs are deliberately not
+# defined here yet — those scripts don't exist (Epic 7/8 unbuilt). Add them
+# once those stories land, per the plan in specs/output/3.user-stories.
+#
+# All region/plan values below were verified against Render's own docs
+# before use — "starter" is valid for web/cron services but is a *legacy*
+# plan for databases (hence basic-256mb, not starter, when not on free).
+#
+# Web service + database are on the free plan for now (testing only, not a
+# real deployment yet) — R-008's cold-start mitigation and the free
+# Postgres's 90-day auto-expiry are both knowingly deferred, not forgotten.
+# Switch both to a paid plan (web: starter; db: basic-256mb) before this
+# becomes anything other than a throwaway environment.
+
+databases:
+  - name: bursatrack-db
+    plan: free
+    region: singapore
+    postgresMajorVersion: "16"
+
+envVarGroups:
+  - name: bursatrack-shared
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bursatrack-db
+          property: connectionString
+      - key: ENVIRONMENT
+        value: staging
+      - key: JWT_ACCESS_TOKEN_EXPIRY_DAYS
+        value: "7"
+      - key: TRIAL_PERIOD_DAYS
+        value: "14"
+      - key: EMAIL_VERIFICATION_TOKEN_EXPIRY_HOURS
+        value: "24"
+      - key: SESSION_COOKIE_NAME
+        value: bursatrack_session
+      - key: COOKIE_SECURE
+        value: "true"
+      # Secrets and deployment-specific values — never committed, filled in
+      # via the Render dashboard on first Blueprint creation (sync: false
+      # only prompts once, per Render's own docs; update these manually in
+      # the dashboard on rotation, not by re-running the Blueprint).
+      - key: JWT_PRIVATE_KEY
+        sync: false
+      - key: JWT_PUBLIC_KEY
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM_ADDRESS
+        sync: false
+      - key: FRONTEND_BASE_URL
+        sync: false # the real Vercel URL — not known until Vercel is provisioned
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false # same dependency — see FRONTEND_BASE_URL above
+      - key: CORS_VERCEL_PREVIEW_REGEX
+        sync: false # depends on the actual Vercel project slug — see app/config.py
+
+services:
+  - name: bursatrack-api
+    type: web
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free # testing only — R-008's cold-start mitigation is deferred; switch to starter before real use
+    region: singapore
+    healthCheckPath: /health
+    # Migration gate (architecture §18.2): if this fails, the deploy aborts
+    # and the previous version keeps running — never a partial/broken deploy.
+    preDeployCommand: uv run alembic upgrade head
+    envVarGroups:
+      - bursatrack-shared
+
+  # - name: bursatrack-refresh-prices
+  #   type: cron
+  #   runtime: docker
+  #   dockerfilePath: backend/Dockerfile
+  #   dockerContext: backend
+  #   plan: starter # cron jobs cannot use the free plan
+  #   region: singapore
+  #   # 09:30 UTC = 5:30 PM MYT, Mon-Fri (architecture §8.4 / BE-5.1)
+  #   schedule: "30 9 * * 1-5"
+  #   startCommand: uv run python scripts/refresh_prices.py
+  #   envVarGroups:
+  #     - bursatrack-shared

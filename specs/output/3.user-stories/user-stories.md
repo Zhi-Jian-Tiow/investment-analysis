@@ -2608,16 +2608,16 @@ Then Vercel auto-deploys the Next.js frontend to production, Render runs
 
 **Acceptance Criteria**
 
-- [ ] Render web service, four cron job schedules (`refresh_prices.py`, `check_trial_expiry.py`, `process_deletions.py`), and managed PostgreSQL are all provisioned (note: architecture §8.4 documents that a previously-planned `process_renewals.py` cron was removed — renewal is Stripe-native, see BE-7.1; do not provision this fourth cron job)
-- [ ] A failed `alembic upgrade head` aborts the deploy and leaves the previous FastAPI version running (architecture §18.2)
-- [ ] Render starter plan (not free tier) is used to avoid cold starts (R-008 mitigation)
-- [ ] CORS configured with the programmatic origin validator from architecture §14.3 — **not** a `"https://*.vercel.app"` wildcard (CRIT-R-001 — this was an explicitly corrected security defect; do not reintroduce the wildcard pattern)
-- [ ] Rollback procedure documented and tested at least once: Vercel "redeploy previous," Render "redeploy previous deploy," `alembic downgrade -1` if needed (architecture §18.4)
-- [ ] ⚠ Known risk accepted for V1 (HIGH-R-003): Vercel preview deployments point at the **production** Render API. All preview testing must use a dedicated non-real test account; never exercise delete/import/PDPA flows against real data from a preview URL. A staging Render service (~USD 7/month) is the recommended medium-term fix — provision before the first paid user, not required to block V1 launch
+- [~] Render web service, four cron job schedules (`refresh_prices.py`, `check_trial_expiry.py`, `process_deletions.py`), and managed PostgreSQL are all provisioned — see Implementation Record Deviation 1: only `refresh_prices.py` is defined; the other two don't exist yet (Epic 7/8 unbuilt), and the environment stood up is a **staging** environment, not literally "production" (Deviation 2)
+- [x] A failed `alembic upgrade head` aborts the deploy and leaves the previous FastAPI version running (architecture §18.2) — `render.yaml`'s `preDeployCommand`; Render's own documented behavior on a non-zero exit
+- [~] Render starter plan (not free tier) is used to avoid cold starts (R-008 mitigation) — the cron job is `plan: starter` (Render disallows `free` for cron jobs regardless); the **web service and database were deliberately switched to `plan: free`** at the user's request, since this is a testing-only environment for now — R-008's cold-start mitigation is knowingly deferred, not forgotten. Switch both back to a paid plan (`starter` / `basic-256mb`) before this stops being throwaway.
+- [x] CORS configured with the programmatic origin validator from architecture §14.3 — **not** a `"https://*.vercel.app"` wildcard (CRIT-R-001) — `add_cors_middleware()` + `cors_vercel_preview_regex`, tested in `tests/test_cors.py`
+- [ ] Rollback procedure documented and tested at least once — not yet done, needs a live Render/Vercel deploy to exist first
+- [~] ⚠ Known risk (HIGH-R-003): Vercel preview deployments point at the production Render API — **superseded by Deviation 2**: with no separate production environment yet, this risk doesn't currently apply in its original form; it will need re-evaluating once a real production environment exists alongside this staging one
 
 **Definition of Done**
 
-- [ ] End-to-end deploy verified: a merged PR reaches production on both Vercel and Render within the expected pipeline time, with migrations applied correctly
+- [ ] End-to-end deploy verified: a merged PR reaches production on both Vercel and Render within the expected pipeline time, with migrations applied correctly — blocked on live account provisioning, see Known gaps
 
 **Dependencies & Integrations**
 
@@ -2627,6 +2627,38 @@ Then Vercel auto-deploys the Next.js frontend to production, Render runs
 
 - All secrets (DATABASE_URL, JWT_PRIVATE_KEY, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, RESEND_API_KEY, SENTRY_DSN, ADMIN_API_KEY) set as Render/Vercel environment variables only — never committed to git (architecture §14.5)
 - Stripe test-mode keys in every non-production environment (MED-R-001)
+
+---
+
+### Implementation Record — DEP-9.3 (code-complete portion)
+
+**What was actually built**
+
+- `app/config.py` — added `cors_vercel_preview_regex: str = ""` (empty/disabled by default, since the real Vercel project slug doesn't exist yet).
+- `app/main.py` — extracted `add_cors_middleware(app, settings)` out of `create_app()` specifically so it's independently testable (the real `app` singleton's middleware is fixed at import time from real settings — it can't be reconfigured per-test the way `Depends(get_settings)` can via `dependency_overrides`). Wires `allow_origin_regex=settings.cors_vercel_preview_regex or None` — the `or None` matters: Starlette treats an empty-string regex as "match everything," not "disabled."
+- `backend/tests/test_cors.py` (new, 5 tests) — static allowlist origin allowed; matching Vercel preview pattern allowed; an unrelated `*.vercel.app` origin explicitly rejected (this is the exact CRIT-R-001 scenario — a bare wildcard would have allowed it); an entirely unrecognised origin rejected; and confirming the disabled (empty-string) regex default doesn't accidentally match every preview URL.
+- `backend/Dockerfile` (new, production — distinct from `Dockerfile.dev`) — same `ghcr.io/astral-sh/uv:0.11.29` pinned-binary pattern as the dev image and CI, `--no-dev` to exclude test-only dependencies, no bind-mount dependency (source baked in via `COPY`), no `--reload`, binds to Render's injected `$PORT` (falls back to 8000 for a manual `docker run`).
+- `render.yaml` (new, repo root) — Render Blueprint defining `bursatrack-db` (managed Postgres, Singapore region), an `envVarGroups` block shared between both services (secrets marked `sync: false` so they're never committed — Render prompts for them once at Blueprint creation), `bursatrack-api` (web service, `runtime: docker` pointing at `backend/Dockerfile`, `healthCheckPath: /health`, `preDeployCommand: uv run alembic upgrade head`), and `bursatrack-refresh-prices` (cron, same Docker image, `schedule: "30 9 * * 1-5"`). Database and web service plans were changed to `free` at the user's explicit request after initial implementation (Deviation 4) — the cron job stays on `starter` since Render doesn't offer a free tier for cron jobs at all.
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **Only one of the three cron jobs is defined in `render.yaml`.** `check_trial_expiry.py` and `process_deletions.py` don't exist as code yet — Epic 7 (Stripe billing) and Epic 8 (PDPA deletion) are unbuilt. Rather than provisioning cron slots pointing at scripts that don't exist, they're left out entirely, with a comment in `render.yaml` itself noting they'll be added once those stories land. This is the user's own explicitly chosen sequencing (see the approved plan: stand up staging now, build Epic 6-8 against it).
+2. **This is a staging environment, not the spec's literal "production."** Architecture §18.3 explicitly says "No staging environment at V1" — its actual V1 design was preview-deploys-hit-production with a mitigation policy (dedicated test account, avoid destructive flows on previews). The user chose differently: stand up a non-public staging environment now, build remaining features against it, defer the public-launch/production decision until Epic 7/8 land. This was discussed and explicitly chosen, not a silent deviation — flagged here for the written record to match every other deviation in this project.
+3. **Region and plan values were verified against Render's live docs before use, not assumed** — an earlier draft would have used `plan: starter` for the database (matching the web service), but `starter` is a *legacy* Postgres plan that new databases can no longer be created on; corrected to `basic-256mb`, the smallest current-generation paid tier. `region: singapore` was similarly confirmed as a real, exact slug (matching architecture's own R-015 note about migrating to Render's Singapore region for Malaysian latency) rather than guessed.
+4. **The web service and database plans were downgraded to `free` after initial implementation, at the user's explicit request**, since this environment is testing-only for now. This knowingly reintroduces R-008's cold-start risk (free web services spin down after 15 min idle) and adds a 90-day auto-expiry on the free Postgres instance — both flagged to the user at the time, not silently applied. The cron job could not follow suit — Render does not offer a free plan for cron jobs at all — so it remains on `starter`, which is also why the AC bullet above is marked partial rather than done.
+
+**Test evidence**
+
+- `uv run pytest tests/test_cors.py -v` — 5/5 passed, including the CRIT-R-001 rejection case.
+- `docker build -t bursatrack-backend-prod-test -f backend/Dockerfile backend` — builds clean.
+- **Live container run**: ran the built production image directly (`docker run`, attached to the existing docker-compose network, `DATABASE_URL` pointed at the compose Postgres, a non-default `$PORT=9000` to prove the port-binding logic isn't hardcoded) — confirmed `GET /health` → `{"status":"ok","db":"ok"}`. Test container and image removed afterward.
+
+**Known gaps / not yet verified**
+
+- **Nothing has actually been deployed to Render or Vercel.** Account creation, connecting the GitHub repo, and applying the Blueprint are manual steps only the user can do (they need the user's own account/authorization) — not done as part of this pass.
+- The `sync: false` secrets in `render.yaml` (JWT keys, `ADMIN_API_KEY`, `RESEND_API_KEY`, `EMAIL_FROM_ADDRESS`, `FRONTEND_BASE_URL`, `CORS_ALLOWED_ORIGINS`, `CORS_VERCEL_PREVIEW_REGEX`) are unset — several of them (the last three) can't even be filled in correctly until the Vercel project exists and its real URL/slug is known.
+- The DoD's rollback-procedure test, and the end-to-end "PR → CI → deploy" verification, both need a live deployment to exist first — neither has been done.
+- Whether Vercel's plan tier supports Deployment Protection (password-gating the staging site) hasn't been checked — depends on which Vercel plan the user signs up for.
 
 ---
 
