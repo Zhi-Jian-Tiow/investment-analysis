@@ -2582,7 +2582,7 @@ Then pytest (backend), tsc --noEmit (frontend types), and eslint (frontend lint)
 **Test evidence**
 
 - All three CI commands run and verified locally, exactly as the workflow invokes them (not just "should work"): `uv run pytest -v` → 231/231 passed (352.97s); `npm run type-check` → clean; `npm run lint` → clean.
-- `astral-sh/setup-uv`'s tag was checked against the live GitHub repo before pinning — an earlier draft used `@v5`, which turned out to be several major versions behind the current `@v9`; corrected before this was considered complete, consistent with backend/Dockerfile.dev's own "pin to a specific uv version" fix from earlier in this session.
+- `astral-sh/setup-uv`'s tag was checked against the live GitHub repo before pinning (WebFetch's own summary of the repo's README first claimed `@v5` was current, which was already stale) — but the corrected `@v9` still failed on the actual, real Actions run once pushed: `Unable to resolve action 'astral-sh/setup-uv@v9', unable to find version 'v9'`. Queried the GitHub API directly (`/git/refs/tags`) rather than trusting a fetched/summarized page a second time, and confirmed this repo — unlike `actions/checkout`/`actions/setup-node`, which do publish floating major tags (`v4` is a real ref for both) — has no floating `v9` tag at all, only the exact `v9.0.0`. Fixed to `astral-sh/setup-uv@v9.0.0`. Worth remembering: don't trust a fetched-and-summarized page for exact version/tag strings when the real, structured source (here, the GitHub API) is one call away.
 
 **Known gaps / not yet verified**
 

@@ -18,7 +18,10 @@ jobs:
 
       # Pinned to the same uv version used locally and in backend/Dockerfile.dev
       # (uv's own Docker guide recommends pinning, not floating on latest).
-      - uses: astral-sh/setup-uv@v9
+      # Unlike actions/checkout or actions/setup-node, this repo doesn't publish
+      # a floating major-version tag (there is no bare "v9" ref) — only exact
+      # "vX.Y.Z" tags exist, so the action itself must be pinned exactly too.
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
 
