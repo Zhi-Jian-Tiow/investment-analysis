@@ -2548,13 +2548,13 @@ Then pytest (backend), tsc --noEmit (frontend types), and eslint (frontend lint)
 
 **Acceptance Criteria**
 
-- [ ] CI workflow file at `.github/workflows/ci.yml` runs all three checks on every PR
-- [ ] Merge to `main` is gated on CI passing (architecture §18.2 flowchart)
-- [ ] CI failure produces a clear, actionable log — not just a red X
+- [x] CI workflow file at `.github/workflows/ci.yml` runs all three checks on every PR
+- [~] Merge to `master` is gated on CI passing (architecture §18.2 flowchart) — see Implementation Record Deviation 1 (workflow triggers wired up; the actual GitHub branch-protection rule requiring the checks still needs to be applied by hand — see Known gaps)
+- [x] CI failure produces a clear, actionable log — not just a red X (three separately-named jobs, not one combined job, so the failing check is obvious from the PR checks list alone)
 
 **Definition of Done**
 
-- [ ] A deliberately broken test/type-error/lint violation in a test PR is confirmed to block the pipeline
+- [ ] A deliberately broken test/type-error/lint violation in a test PR is confirmed to block the pipeline — not yet done, see Known gaps
 
 **Dependencies & Integrations**
 
@@ -2563,6 +2563,32 @@ Then pytest (backend), tsc --noEmit (frontend types), and eslint (frontend lint)
 **Technical Constraints**
 
 - None additional
+
+---
+
+### Implementation Record — DEP-9.2
+
+**What was actually built**
+
+- `.github/workflows/ci.yml` (new) — three separate jobs (`backend-tests`, `frontend-type-check`, `frontend-lint`) triggered on every PR and push targeting the default branch, so a failure in one is immediately attributable in the GitHub PR checks list rather than buried inside one combined job's log.
+- `backend-tests` — `astral-sh/setup-uv@v9` pinned to `uv==0.11.29` (the same version pinned in `backend/Dockerfile.dev` and used locally), `uv python install 3.13`, `uv sync --frozen`, `uv run pytest -v`.
+- `frontend-type-check` / `frontend-lint` — `actions/setup-node@v4` on Node 22 (matching `frontend/Dockerfile.dev`), `npm ci`, then `npm run type-check` / `npm run lint` respectively.
+- `frontend/package.json` — added a `type-check` script (`tsc --noEmit`) since none existed; the story's own Gherkin names this check explicitly and it wasn't previously exposed as a reusable command (only folded implicitly into `next build`'s own type-checking step).
+
+**Deviations from the spec (deliberate adaptations, not oversights)**
+
+1. **The workflow targets `master`, not `main`.** The story's AC and Gherkin both say "merge to main" — but this repository's actual default branch (confirmed via `git branch --show-current` and `git remote show origin`) is `master`, and always has been throughout this project. Caught before pushing rather than shipping a workflow that would silently never trigger. `on.pull_request.branches` / `on.push.branches` are both set to `[master]`.
+
+**Test evidence**
+
+- All three CI commands run and verified locally, exactly as the workflow invokes them (not just "should work"): `uv run pytest -v` → 231/231 passed (352.97s); `npm run type-check` → clean; `npm run lint` → clean.
+- `astral-sh/setup-uv`'s tag was checked against the live GitHub repo before pinning — an earlier draft used `@v5`, which turned out to be several major versions behind the current `@v9`; corrected before this was considered complete, consistent with backend/Dockerfile.dev's own "pin to a specific uv version" fix from earlier in this session.
+
+**Known gaps / not yet verified**
+
+- **The DoD's own explicit requirement — a deliberately-broken PR confirmed to block the pipeline — has not been done.** This needs the workflow actually pushed to GitHub and a real PR opened against it, which wasn't done as part of this pass (no `git push`/PR was created without the user's go-ahead, since pushing to the real shared remote is a separate, explicit action). Do this before considering DEP-9.2 fully done.
+- **Branch protection requiring these checks has not been applied.** `.github/workflows/ci.yml` makes the checks *available* to run, but doesn't by itself block merging — that's a separate GitHub repository setting (Settings → Branches → branch protection rule on `master` → "Require status checks to pass"). No `gh` CLI is installed on this machine to script it, and applying a branch-protection rule is a real change to shared repository settings that shouldn't happen without the user directly authorizing it. Manual steps to close this gap are documented for the user.
+- The full backend `pytest` run took ~6 minutes locally — acceptable for CI, but worth knowing if CI minutes/time-to-signal ever becomes a concern later.
 
 ---
 
