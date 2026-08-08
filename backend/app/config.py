@@ -141,6 +141,25 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
 
 
+def _log_pem_diagnostic(name: str, value: str) -> None:
+    # TEMPORARY — debugging a production PEM-parsing failure that the
+    # flattened-newline repair didn't fix. Logs shape only, never content:
+    # no slice of `value` is ever printed, so this is safe to leave in
+    # Render's logs. Remove once the real cause is confirmed and fixed.
+    print(
+        f"[pem-diagnostic] {name}: len={len(value)} "
+        f"newline_count={value.count(chr(10))} "
+        f"contains_BEGIN={'BEGIN' in value} "
+        f"contains_END={'END' in value} "
+        f"contains_literal_backslash_n={chr(92) + 'n' in value} "
+        f"leading_ws={repr(value[:1]) if value else None} "
+        f"trailing_ws={repr(value[-1:]) if value else None}"
+    )
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    _log_pem_diagnostic("jwt_private_key", settings.jwt_private_key)
+    _log_pem_diagnostic("jwt_public_key", settings.jwt_public_key)
+    return settings
