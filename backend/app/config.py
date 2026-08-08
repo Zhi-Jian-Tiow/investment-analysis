@@ -5,11 +5,13 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # PEM header/footer candidates tried, in order, when a jwt_private_key /
-# jwt_public_key value has no "-----BEGIN ...-----" armor at all — the
-# signature of someone having pasted only the base64 body of a generated key
-# (e.g. copying between the header/footer lines rather than including them).
-# Only engaged when "BEGIN" is missing from the raw value, so a
-# correctly-armored key is never touched.
+# jwt_public_key value can't be loaded as-is — either because it has no
+# "-----BEGIN ...-----" armor at all (only the base64 body was pasted), or
+# because the armor is present but a single-line env-var editor (e.g.
+# Render's dashboard) flattened the real newlines out of a multi-line paste,
+# leaving "-----BEGIN...-----MIIEv...-----END...-----" all on one line —
+# cryptography rejects that as MalformedFraming even though "BEGIN" is
+# present, which is exactly why this can't gate on "BEGIN" being absent.
 _PRIVATE_KEY_HEADERS = [
     ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"),  # PKCS8
     ("-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----"),  # PKCS1
@@ -30,10 +32,24 @@ def _reflow_pem_body(raw: str) -> str:
 
 def _repair_missing_pem_armor(raw: str, headers: list[tuple[str, str]], loader) -> str:
     value = raw.strip()
-    if not value or "BEGIN" in value:
-        return value  # empty, or already has real armor — leave untouched
+    if not value:
+        return value
 
-    body = _reflow_pem_body(value)
+    # Fast path: already correctly formatted (real newlines intact) — the
+    # overwhelmingly common case for local dev's multi-line .env value.
+    try:
+        loader(value.encode())
+        return value
+    except Exception:
+        pass
+
+    # Strip any header/footer text that IS present before reflowing, so it
+    # doesn't get mangled into the base64 body alongside it.
+    body = value
+    for header, footer in headers:
+        body = body.replace(header, "").replace(footer, "")
+    body = _reflow_pem_body(body)
+
     for header, footer in headers:
         candidate = f"{header}\n{body}\n{footer}\n"
         try:
